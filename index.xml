@@ -1,2 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Blind Producers"/>
+<index version="1" name="Blind Producers" commit="26c120b4e39879c1d56f03a8db045db9f742f1eb">
+  <category name="Dynamics">
+    <reapack name="BP Carve.jsfx" type="effect" desc="BP Carve">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Cuts resonances as they happen, and makes room for another track by dipping the frequencies that track is using.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Resonances: raise Depth for stronger cuts, lower Threshold to catch smaller peaks, and set Sharpness for broad smoothing (low) or narrow peaks (high). Listen set to Removed plays only what the plugin takes out.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Making room: send the other track to channels 3 and 4 of this track, which needs 4 channels. For ducking only, set Depth to 0.\sa180\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.0" author="Blind Producers" time="2026-11-25T23:35:32Z">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source>https://github.com/BlindProducers/reapack/raw/26c120b4e39879c1d56f03a8db045db9f742f1eb/Dynamics/BP%20Carve.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+  <metadata>
+    <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel0 \b \fs36 Blind Producers ReaPack repository\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 REAPER plugins from Blind Producers, installed and updated through {\field{\*\fldinst{HYPERLINK "https://reapack.com"}}{\fldrslt{\ul
+ReaPack
+}}}
+.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Install\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 1.\tx360\tab In REAPER, choose Extensions > ReaPack > Import repositories.\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 2.\tx360\tab Paste this URL and press OK:\par}
+{\pard \ql \f0 \sa180 \li360 \fi0 \f1 https://github.com/BlindProducers/reapack/raw/main/index.xml\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 3.\tx360\tab Choose Extensions > ReaPack > Browse packages and install the plugins you want.\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Update\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Choose Extensions > ReaPack > Synchronize packages. ReaPack updates every installed plugin to its latest version.\par}
+}
+]]></description>
+  </metadata>
+</index>
