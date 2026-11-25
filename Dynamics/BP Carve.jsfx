@@ -1,0 +1,372 @@
+desc:BP Carve
+author: Blind Producers
+version: 1.0
+tags: resonance suppressor dynamic eq spectral sidechain ducking unmasking
+changelog:
+  Initial release
+about:
+  Cuts resonances as they happen, and makes room for another track by dipping the frequencies that track is using.
+  - Resonances: raise Depth for stronger cuts, lower Threshold to catch smaller peaks, and set Sharpness for broad smoothing (low) or narrow peaks (high). Listen set to Removed plays only what the plugin takes out.
+  - Making room: send the other track to channels 3 and 4 of this track, which needs 4 channels. For ducking only, set Depth to 0.
+
+slider1:depth=6<0,20,0.1>Depth (dB)
+slider2:sharp=50<0,100,1>Sharpness (%)
+slider3:thr=4<0,20,0.1>Threshold (dB)
+slider4:att_ms=5<0,200,0.1>Attack (ms)
+slider5:rel_ms=60<1,1000,1>Release (ms)
+slider6:f_lo=250<20,20000,1:log>Lowest frequency (Hz)
+slider7:f_hi=20000<20,20000,1:log>Highest frequency (Hz)
+slider8:sc_depth=6<0,20,0.1>Sidechain depth (dB)
+slider9:sc_thr=-50<-80,0,0.1>Sidechain threshold (dB)
+slider10:stereo=0<0,2,1{Linked,Left and right,Mid and side}>Stereo
+slider11:res=1<0,2,1{Low,Medium,High}>Resolution
+slider12:mix=100<0,100,0.1>Mix (%)
+slider13:out_db=0<-24,24,0.1>Output (dB)
+slider14:listen=0<0,1,1{Result,Removed}>Listen
+
+options:maxmem=1048576
+
+in_pin:left input
+in_pin:right input
+in_pin:sidechain left
+in_pin:sidechain right
+out_pin:left output
+out_pin:right output
+
+@init
+// How it works. A short-time FFT (Hann windows, 8x overlap) turns the input into a spectrum
+// every 1/8 frame; each bin gets a gain, and overlap-add rebuilds the audio. The plugin reports
+// one frame of latency, which REAPER compensates. With no cut the output equals the input.
+//
+// Resonances. The detection level of each bin is its power averaged over about 20 ms. An
+// envelope drawn through the spectrum's local peaks (straight lines from peak to peak) hides
+// the gaps between harmonics, so a regular harmonic series is not taken for resonances; it is
+// smoothed over 1/3 octave at 0 % Sharpness down to 1/24 octave at 100 %. That envelope is
+// compared with a reference: a 2.5-octave average in dB (follows broad tonal balance, so a
+// whole harsh region stands out) blended with a 1.5-octave power average (dominated by the
+// loudest parts, so only narrow peaks stand out). Sharpness moves the blend from the first to
+// the second. Both averages are even over log frequency and are taken twice, the second time
+// with the envelope clipped 3 dB above the first, so a strong resonance does not lift its own
+// reference. How far the envelope rises above the reference counts up to twice as much
+// around 4.5 kHz, where the ear is most sensitive to harshness. Above Threshold (4 dB soft
+// knee) the cut grows toward Depth: cut = Depth * (1 - exp(-excess / Depth)).
+//
+// Sidechain. The sidechain's level in 1/3-octave bands (a full-scale sine reads 0 dB) cuts the
+// main signal at the same frequencies by half a dB per dB above Sidechain threshold, easing
+// toward Sidechain depth. Resonance and sidechain cuts add, then follow Attack and Release.
+// analysis/model.py is the reference model; analysis/test_render.py checks the plugin against it.
+
+buf_a = 0; buf_b = 16384; buf_c = 32768; buf_d = 49152;  // FFT buffers: one 65536-slot block
+in_a = 65536; in_b = in_a + 16384; in_c = in_b + 16384; in_d = in_c + 16384;
+out_a = in_d + 16384; out_b = out_a + 16384;
+win_t = out_b + 16384; ola_t = win_t + 16384;
+bstride = 8448;  // per-bin arrays: up to 8193 bins plus one for prefix sums
+wgt_t = ola_t + 16384; cw_t = wgt_t + bstride;
+fl_lo = cw_t + bstride; fl_hi = fl_lo + bstride; fl_inv = fl_hi + bstride;
+lc_lo = fl_inv + bstride; lc_hi = lc_lo + bstride; lc_inv = lc_hi + bstride;
+wd_lo = lc_inv + bstride; wd_hi = wd_lo + bstride; wd_inv = wd_hi + bstride;
+sb_lo = wd_inv + bstride; sb_hi = sb_lo + bstride;
+emul_t = sb_hi + bstride; wr_t = emul_t + bstride;
+pw_0 = wr_t + bstride; pw_1 = pw_0 + bstride;
+ps_0 = pw_1 + bstride; ps_1 = ps_0 + bstride;
+cut_0 = ps_1 + bstride; cut_1 = cut_0 + bstride;
+gn_0 = cut_1 + bstride; gn_1 = gn_0 + bstride;
+lv_t = gn_1 + bstride; fe_t = lv_t + bstride; fs_t = fe_t + bstride; lin_t = fs_t + bstride;
+cum_f = lin_t + bstride; cum_l = cum_f + bstride; cum_w = cum_l + bstride;
+cum_c = cum_w + bstride; cum_d = cum_c + bstride;
+scut_t = cum_d + bstride; mem_end = scut_t + bstride;
+
+lvl_floor = 10 ^ -14;
+ln10_10 = log(10) / 10;
+ln10_20 = log(10) / 20;
+clip_lin = 10 ^ 0.3;
+cut_min = 10 ^ -9;  // smaller cuts (dB) are flushed to zero
+cur_n = 0;  // forces update() to rebuild the tables (memory is cleared before @init)
+
+function soft_knee(e)
+(
+  e <= -2 ? 0 : (e >= 2 ? e : sqr(e + 2) * 0.125);
+);
+
+// Averaging window [lo, hi] for every bin, width_oct octaves wide and at least minhalf bins to
+// each side, and inv = 1 / (sum of the 1/bin weights in it).
+function make_win(lo, hi, inv, width_oct, minhalf) local(k, r, a, b)
+(
+  r = 2 ^ (width_oct / 2);
+  k = 0;
+  loop(nbins,
+    lo[k] = a = max(0, min(k - minhalf, floor(k / r + 0.5)));
+    hi[k] = b = min(nbins - 1, max(k + minhalf, floor(k * r + 0.5)));
+    inv ? (inv[k] = 1 / (cw_t[b + 1] - cw_t[a]));
+    k += 1;
+  );
+);
+
+// fe_t = straight lines between the local maxima of lv_t, held flat beyond the first and last.
+function peak_env() local(k, pm, j, v0, sl)
+(
+  pm = -1;
+  k = 1;
+  loop(nbins - 2,
+    (lv_t[k] >= lv_t[k - 1] && lv_t[k] > lv_t[k + 1]) ? (
+      pm < 0 ? (
+        j = 0; loop(k, fe_t[j] = lv_t[k]; j += 1;);
+      ) : (
+        k - pm > 1 ? (
+          v0 = lv_t[pm]; sl = (lv_t[k] - v0) / (k - pm);
+          j = pm + 1; loop(k - pm - 1, fe_t[j] = v0 + sl * (j - pm); j += 1;);
+        );
+      );
+      fe_t[k] = lv_t[k];
+      pm = k;
+    );
+    k += 1;
+  );
+  pm < 0 ? memcpy(fe_t, lv_t, nbins) : (
+    j = pm + 1; loop(nbins - 1 - pm, fe_t[j] = lv_t[pm]; j += 1;);
+  );
+);
+
+// One detection channel: pw holds this frame's power per bin, ps and cut are its smoothed
+// power and cut, gn receives the gain per bin. Averages use prefix sums (cum_*), weighted by
+// 1/bin so they are even over log frequency.
+function detect(pw, ps, cut, gn) local(k, v, a, b, s1, s2, fs, lin, m, cl, cw, e, ct, g)
+(
+  k = 0;
+  loop(nbins,
+    v = ps[k] + (pw[k] - ps[k]) * a_det;
+    v < ps_min ? (v = 0);
+    ps[k] = v;
+    depth > 0 ? (lv_t[k] = 10 * log10(v * cal + lvl_floor));
+    k += 1;
+  );
+  depth > 0 ? (
+    peak_env();
+    s1 = 0; k = 0;
+    loop(nbins, s1 += wgt_t[k] * fe_t[k]; k += 1; cum_f[k] = s1;);
+    // fs_t: envelope smoothed by Sharpness; prefix sums of its power (cum_l) and dB (cum_w)
+    s1 = s2 = 0; k = 0;
+    loop(nbins,
+      fs = (cum_f[fl_hi[k] + 1] - cum_f[fl_lo[k]]) * fl_inv[k];
+      fs_t[k] = fs;
+      lin_t[k] = lin = exp(fs * ln10_10);
+      s1 += wgt_t[k] * lin;
+      s2 += wgt_t[k] * fs;
+      k += 1; cum_l[k] = s1; cum_w[k] = s2;
+    );
+    // first passes of both references, then prefix sums of the envelope clipped above them
+    s1 = s2 = 0; k = 0;
+    loop(nbins,
+      a = lc_lo[k]; b = lc_hi[k] + 1;
+      m = (cum_l[b] - cum_l[a]) * lc_inv[k];
+      s1 += wgt_t[k] * min(lin_t[k], m * clip_lin);
+      a = wd_lo[k]; b = wd_hi[k] + 1;
+      m = (cum_w[b] - cum_w[a]) * wd_inv[k];
+      s2 += wgt_t[k] * min(fs_t[k], m + 3);
+      k += 1; cum_c[k] = s1; cum_d[k] = s2;
+    );
+  );
+  k = 0;
+  loop(nbins,
+    ct = scut_t[k];
+    (depth > 0 && wr_t[k] > 0) ? (
+      a = lc_lo[k]; b = lc_hi[k] + 1;
+      cl = 10 * log10((cum_c[b] - cum_c[a]) * lc_inv[k]);
+      a = wd_lo[k]; b = wd_hi[k] + 1;
+      cw = (cum_d[b] - cum_d[a]) * wd_inv[k];
+      e = (fs_t[k] - cw - beta * (cl - cw)) * emul_t[k] - thr;
+      e > -2 ? (ct += wr_t[k] * depth * (1 - exp(-soft_knee(e) / depth)));
+    );
+    v = cut[k];
+    v += (ct - v) * (ct > v ? a_att : a_rel);
+    v < cut_min ? (v = 0);
+    cut[k] = v;
+    g = v > 0 ? 1 - mix_f + mix_f * exp(-v * ln10_20) : 1;
+    gn[k] = (listen ? 1 - g : g) * out_gain;
+    k += 1;
+  );
+);
+
+// Sidechain cut per bin into scut_t.
+function sidechain_cut() local(k, j, s, b, r)
+(
+  fft_real(buf_c, fftn); fft_permute(buf_c, fftn / 2);
+  fft_real(buf_d, fftn); fft_permute(buf_d, fftn / 2);
+  s = (sqr(buf_c[0]) + sqr(buf_d[0])) * 0.5;
+  cum_f[1] = s;
+  k = 1; j = 2;
+  loop(nbins - 2,
+    s += (sqr(buf_c[j]) + sqr(buf_c[j + 1]) + sqr(buf_d[j]) + sqr(buf_d[j + 1])) * 0.5;
+    k += 1; j += 2;
+    cum_f[k] = s;
+  );
+  s += (sqr(buf_c[1]) + sqr(buf_d[1])) * 0.5;
+  cum_f[nbins] = s;
+  k = 0;
+  loop(nbins,
+    b = (cum_f[sb_hi[k] + 1] - cum_f[sb_lo[k]]) * cal;
+    b > sc_min ? (
+      r = soft_knee(10 * log10(b + lvl_floor) - sc_thr) * 0.5;
+      scut_t[k] = sc_depth * (1 - exp(-r / sc_depth));
+    ) : (
+      scut_t[k] = 0;
+    );
+    k += 1;
+  );
+);
+
+function bin_power(pw, fa, fb, both) local(k, j)
+(
+  both ? (
+    pw[0] = (sqr(fa[0]) + sqr(fb[0])) * 0.5;
+    pw[nbins - 1] = (sqr(fa[1]) + sqr(fb[1])) * 0.5;
+    k = 1; j = 2;
+    loop(nbins - 2,
+      pw[k] = (sqr(fa[j]) + sqr(fa[j + 1]) + sqr(fb[j]) + sqr(fb[j + 1])) * 0.5;
+      k += 1; j += 2;
+    );
+  ) : (
+    pw[0] = sqr(fa[0]);
+    pw[nbins - 1] = sqr(fa[1]);
+    k = 1; j = 2;
+    loop(nbins - 2, pw[k] = sqr(fa[j]) + sqr(fa[j + 1]); k += 1; j += 2;);
+  );
+);
+
+// Multiply the spectra fa and fb by the gains ga and gb.
+function apply_gains(fa, fb, ga, gb) local(k, j, g)
+(
+  fa[0] *= ga[0]; fb[0] *= gb[0];
+  fa[1] *= ga[nbins - 1]; fb[1] *= gb[nbins - 1];
+  k = 1; j = 2;
+  loop(nbins - 2,
+    g = ga[k]; fa[j] *= g; fa[j + 1] *= g;
+    g = gb[k]; fb[j] *= g; fb[j + 1] *= g;
+    k += 1; j += 2;
+  );
+);
+
+function run_frame() local(k, j, w, e_sc, a, b, sc_on)
+(
+  sc_on = sc_depth > 0;
+  e_sc = 0;
+  j = pos; k = 0;
+  loop(fftn,
+    w = win_t[k];
+    buf_a[k] = in_a[j] * w;
+    buf_b[k] = in_b[j] * w;
+    sc_on ? (
+      buf_c[k] = a = in_c[j] * w;
+      buf_d[k] = b = in_d[j] * w;
+      e_sc += a * a + b * b;
+    );
+    k += 1; j += 1; j >= fftn ? (j = 0);
+  );
+  fft_real(buf_a, fftn); fft_permute(buf_a, fftn / 2);
+  fft_real(buf_b, fftn); fft_permute(buf_b, fftn / 2);
+  stereo == 2 ? (
+    k = 0;
+    loop(fftn, a = buf_a[k]; b = buf_b[k]; buf_a[k] = (a + b) * 0.5; buf_b[k] = (a - b) * 0.5; k += 1;);
+  );
+  // a sidechain this quiet (about -170 dB) cannot reach the lowest threshold
+  (sc_on && e_sc > 0.00000000000001) ? sidechain_cut() : memset(scut_t, 0, nbins);
+  stereo == 0 ? (
+    bin_power(pw_0, buf_a, buf_b, 1);
+    detect(pw_0, ps_0, cut_0, gn_0);
+    apply_gains(buf_a, buf_b, gn_0, gn_0);
+  ) : (
+    bin_power(pw_0, buf_a, 0, 0);
+    bin_power(pw_1, buf_b, 0, 0);
+    detect(pw_0, ps_0, cut_0, gn_0);
+    detect(pw_1, ps_1, cut_1, gn_1);
+    apply_gains(buf_a, buf_b, gn_0, gn_1);
+  );
+  stereo == 2 ? (
+    k = 0;
+    loop(fftn, a = buf_a[k]; b = buf_b[k]; buf_a[k] = a + b; buf_b[k] = a - b; k += 1;);
+  );
+  fft_ipermute(buf_a, fftn / 2); ifft_real(buf_a, fftn);
+  fft_ipermute(buf_b, fftn / 2); ifft_real(buf_b, fftn);
+  j = pos; k = 0;
+  loop(fftn,
+    w = ola_t[k];
+    out_a[j] += buf_a[k] * w;
+    out_b[j] += buf_b[k] * w;
+    k += 1; j += 1; j >= fftn ? (j = 0);
+  );
+);
+
+// Rebuild what depends on the sliders, the sample rate and the FFT size.
+function update() local(mm, nn, k, f, lg, s, x)
+(
+  mm = 1;
+  loop(2, srate / mm > 64000 ? (mm *= 2););
+  nn = (res == 0 ? 1024 : (res == 1 ? 2048 : 4096)) * mm;
+  (nn != cur_n || srate != cur_sr) ? (
+    fftn = nn; hop = fftn / 8; nbins = fftn / 2 + 1;
+    memset(0, 0, mem_end);  // buffers, rings, tables and per-bin states
+    k = 0;
+    loop(fftn,
+      win_t[k] = 0.5 - 0.5 * cos(2 * $pi * k / fftn);
+      ola_t[k] = win_t[k] / (6 * fftn);  // 1/3 for the overlapping squared windows, 1/(2N) for fft_real/ifft_real
+      k += 1;
+    );
+    cal = 8 / (3 * fftn * fftn);  // fft_real's scale: the bins of a full-scale sine sum to 0 dB
+    ps_min = 10 ^ -20 / cal;      // smaller smoothed powers are flushed to zero
+    s = 0; k = 0;
+    loop(nbins, wgt_t[k] = 1 / max(k, 1); s += wgt_t[k]; k += 1; cw_t[k] = s;);
+    make_win(lc_lo, lc_hi, lc_inv, 1.5, 3);
+    make_win(wd_lo, wd_hi, wd_inv, 2.5, 3);
+    make_win(sb_lo, sb_hi, 0, 1 / 3, 2);
+    k = 0;
+    loop(nbins,
+      x = max(-1, min(1, (log(max(k * srate / fftn, 0.000000001)) / log(2) - log(4500) / log(2)) / 1.25));
+      emul_t[k] = 1.5 + 0.5 * cos($pi * x);
+      k += 1;
+    );
+    pos = 0; hop_cnt = 0;
+    cur_n = fftn; cur_sr = srate;
+    cur_sharp = cur_flo = cur_fhi = -1;
+    pdc_delay = fftn; pdc_bot_ch = 0; pdc_top_ch = 2;
+  );
+  sharp != cur_sharp ? (
+    beta = sharp / 100;
+    make_win(fl_lo, fl_hi, fl_inv, (1 / 3) * 8 ^ -beta, 1);
+    cur_sharp = sharp;
+  );
+  (f_lo != cur_flo || f_hi != cur_fhi) ? (
+    k = 0;
+    loop(nbins,
+      lg = log(max(k * srate / fftn, 0.000000001)) / log(2);
+      f = 0.5 + 0.5 * cos($pi * max(0, min(1, (log(f_lo) / log(2) - lg) / 0.5)));
+      wr_t[k] = f * (0.5 + 0.5 * cos($pi * max(0, min(1, (lg - log(f_hi) / log(2)) / 0.5))));
+      k += 1;
+    );
+    cur_flo = f_lo; cur_fhi = f_hi;
+  );
+  a_det = 1 - exp(-hop / (0.02 * srate));
+  a_att = att_ms > 0 ? 1 - exp(-hop / (att_ms * 0.001 * srate)) : 1;
+  a_rel = 1 - exp(-hop / (rel_ms * 0.001 * srate));
+  sc_min = 10 ^ ((sc_thr - 2) / 10) - lvl_floor;  // band power below this gives no sidechain cut
+  mix_f = mix / 100;
+  out_gain = 10 ^ (out_db / 20);
+);
+
+@slider
+update();
+
+@block
+(cur_n == 0 || srate != cur_sr) ? update();
+
+@sample
+o0 = out_a[pos]; o1 = out_b[pos];
+out_a[pos] = 0; out_b[pos] = 0;
+in_a[pos] = spl0; in_b[pos] = spl1; in_c[pos] = spl2; in_d[pos] = spl3;
+spl0 = o0; spl1 = o1;
+pos += 1;
+pos >= fftn ? (pos = 0);
+hop_cnt += 1;
+hop_cnt >= hop ? (
+  hop_cnt = 0;
+  run_frame();
+);
