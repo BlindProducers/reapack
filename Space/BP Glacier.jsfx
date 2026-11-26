@@ -1,0 +1,503 @@
+desc:BP Glacier
+author: Blind Producers
+version: 1.0
+tags: reverb freeze granular grains ambient hall room modulation
+changelog:
+  Initial release
+about:
+  A lush, modulated reverb that goes from a tight room to endless soundscapes, with Freeze to hold the tail.
+  - The granular section, off by default, plays grains from the reverb tail or the input: pitched, reversed and scattered across the stereo field, and fed back into the reverb if you want clouds that build on themselves.
+
+slider1:s_size=55<0,100,0.1>Size (%)
+slider2:s_decay=3.5<0.1,100,0.01:log>Decay (s)
+slider3:s_pre=10<0,500,0.1>Pre-delay (ms)
+slider4:s_diff=85<0,100,0.1>Diffusion (%)
+slider5:s_mdepth=45<0,100,0.1>Modulation depth (%)
+slider6:s_mrate=0.5<0.05,5,0.01:log>Modulation rate (Hz)
+slider7:s_damp=6000<500,20000,1:log>Damping (Hz)
+slider8:s_lcut=80<20,2000,1:log>Low cut (Hz)
+slider9:s_hcut=14000<500,20000,1:log>High cut (Hz)
+slider10:s_width=100<0,100,0.1>Width (%)
+slider11:s_freeze=0<0,1,1{Off,On}>Freeze
+slider12:s_mix=40<0,100,0.1>Mix (%)
+slider13:s_out=0<-24,24,0.1>Output (dB)
+slider14:s_grains=0<0,2,1{Off,On,While frozen}>Grains
+slider15:s_gsrc=0<0,1,1{Reverb,Input}>Grain source
+slider16:s_gsize=150<10,1000,1:log>Grain size (ms)
+slider17:s_gdens=12<1,50,0.1:log>Grain density (per second)
+slider18:s_gspray=400<0,2000,1>Grain spray (ms)
+slider19:s_gpitch=0<-24,24,1>Grain pitch (semitones)
+slider20:s_grand=12<0,24,0.1>Grain pitch random (semitones)
+slider21:s_gquant=2<0,3,1{Off,Semitones,Fifths and octaves,Octaves}>Grain pitch quantize
+slider22:s_grev=30<0,100,1>Grain reverse (%)
+slider23:s_gshape=0<0,3,1{Smooth,Flat,Plucked,Swell}>Grain shape
+slider24:s_gspread=80<0,100,1>Grain spread (%)
+slider25:s_gmix=50<0,100,0.1>Grain mix (%)
+slider26:s_gfb=30<0,100,0.1>Grains into reverb (%)
+
+options:maxmem=16777216
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// Signal flow: pre-delay -> 5 Hz DC blocker -> diffuser -> 16-line feedback delay network (the tank)
+// -> grains (optional) -> width -> low cut and high cut -> mix.
+//
+// Diffuser: 4 steps on 8 channels (left on even channels, right on odd ones). Each step delays every
+// channel by its own time, flips some polarities and mixes the channels with a Hadamard matrix. Step k
+// spans 2^k/15 of the diffusion time (Diffusion x the tank's mean delay), and its 8 delays are spread
+// over that span in random order. Diffuser delays are whole samples once settled; they glide with
+// linear interpolation only while Size or Diffusion moves.
+//
+// Tank: 16 delay lines, lengths 0.45 to 1.55 x the mean delay (5 ms at Size 0, 250 ms at Size 100,
+// exponential in between). Each line is modulated by its own sine LFO (0.6 to 1.4 x Modulation rate)
+// and read through a 2nd-order Thiran allpass for the fraction of a sample, which keeps every frequency
+// at full level however the delay moves (an interpolating FIR would dull the tail on each pass).
+// Per line, a decay gain sets the reverb time exactly (10^(-3 d / (Decay x srate)) for a line of
+// d samples), and a one-pole shelf at Damping makes frequencies above it decay four times as fast.
+// The lines are mixed with a 16 x 16 Hadamard matrix, which loses no energy, so Freeze (gain 1,
+// no damping, no input) holds the tail.
+// The output is two orthogonal sums of the lines, scaled by (mean delay / 35 ms)^0.37 so that Size
+// doesn't change the level of a sustained sound (measured); sustained pink noise comes out about 3 dB
+// below the input at the default settings.
+//
+// Glides: Size, Pre-delay and Diffusion follow the sliders with a 150 ms glide, at most a quarter of a
+// sample per sample (a pitch bend of about 4 semitones while they move).
+//
+// Grains: a mono buffer keeps the last 8 s or more of the reverb (or the input). Up to 16 grains read
+// from it with cubic interpolation, each with its own start (up to Grain spray back, and far enough
+// back that a pitched-up grain never reaches the present), pitch, direction, length (+/- 15 %) and pan.
+// Grain level is normalized by the expected overlap. Grains into reverb feeds them back into the
+// diffuser. Freeze stops the feed too, so a frozen tail stays as it is while grains play over it.
+//
+// Guards: while the reverb is above -9 dBFS RMS (averaged over 100 ms), everything entering the
+// tank is turned down to hold it there, so very long decays with loud sustained input can't build up
+// without limit. Grains fed back into a long reverb can grow on their own however quiet the input is,
+// so the feed is also turned down while the reverb is more than 6 dB above the input's level
+// (50 ms attack, 2 s release): the cloud follows the input and dies away at the Decay time once it
+// stops. At ordinary levels and decay times neither does anything.
+
+ext_tail_size = -1;
+first = 1;
+
+function p2(x) ( 2 ^ ceil(log(x) / log(2)); );
+TSZ = p2(0.42 * srate + 16); TMSK = TSZ - 1;   // tank line
+DSZ = p2(0.15 * srate + 16); DMSK = DSZ - 1;   // diffuser channel
+PSZ = p2(0.51 * srate + 16); PMSK = PSZ - 1;   // pre-delay channel
+GSZ = p2(8.2 * srate); GMSK = GSZ - 1;         // grain buffer
+WTS = 1032;                                    // grain window table stride (1025 points used)
+tbase = 0;
+dbase = tbase + 16 * TSZ;
+pbase = dbase + 32 * DSZ;
+gbase = pbase + 2 * PSZ;
+wtab = gbase + GSZ;
+arr = wtab + 4 * WTS;
+memset(0, 0, arr + 256);
+
+SQ2 = sqrt(2);
+HS8 = 1 / sqrt(8);
+KS = 1 - exp(-1 / (0.02 * srate));     // 20 ms smoothing for gains
+DCR = 1 - 2 * $pi * 5 / srate;
+KENV = 1 - exp(-1 / (0.1 * srate));   // guard: 100 ms average of the reverb's power
+KIA = 1 - exp(-1 / (0.05 * srate));   // input level for the grain feed: 50 ms attack
+KIR = 1 - exp(-1 / (2 * srate));      // and 2 s release
+
+rseed = 20261126;
+function rnd01() ( rseed *= 16807; rseed -= floor(rseed / 2147483647) * 2147483647; rseed / 2147483647; );
+function shuffle(a, cnt) local(i, j, t) (
+  i = cnt - 1;
+  loop(cnt - 1, j = floor(rnd01() * (i + 1)); t = a[i]; a[i] = a[j]; a[j] = t; i -= 1; );
+);
+
+// line lengths (x mean delay), LFO rates (x Modulation rate) and LFO phases, shuffled independently
+tr = arr; tw = arr + 16; tp = arr + 32; dfr = arr + 48; dsg = arr + 80; perm = arr + 112; mw2 = arr + 120;
+i = 0;
+loop(16,
+  tr[i] = 0.45 * (1.55 / 0.45) ^ ((i + 0.2 + 0.6 * rnd01()) / 16);
+  tw[i] = 0.6 + 0.8 * (i + rnd01()) / 16;
+  tp[i] = 2 * $pi * rnd01();
+  i += 1;
+);
+shuffle(tr, 16); shuffle(tw, 16);
+
+// diffuser delays (x diffusion time) and polarities
+k = 0;
+loop(4,
+  i = 0; loop(8, perm[i] = i; i += 1; );
+  shuffle(perm, 8);
+  i = 0;
+  loop(8,
+    dfr[8 * k + i] = 2 ^ k / 15 * (perm[i] + 0.15 + 0.7 * rnd01()) / 8;
+    dsg[8 * k + i] = rnd01() < 0.5 ? -1 : 1;
+    i += 1;
+  );
+  k += 1;
+);
+
+// grain windows: Smooth (Hann), Flat (10 % fades), Plucked (fast attack, exponential decay), Swell (Plucked reversed)
+i = 0;
+loop(1025,
+  t = i / 1024;
+  wtab[i] = 0.5 - 0.5 * cos(2 * $pi * t);
+  wtab[WTS + i] = t < 0.1 ? 0.5 - 0.5 * cos($pi * t / 0.1) : (t > 0.9 ? 0.5 - 0.5 * cos($pi * (1 - t) / 0.1) : 1);
+  e = t < 0.02 ? 0.5 - 0.5 * cos($pi * t / 0.02) : exp(-5 * (t - 0.02) / 0.98);
+  t > 0.95 ? (e *= 0.5 + 0.5 * cos($pi * (t - 0.95) / 0.05));
+  wtab[2 * WTS + i] = e;
+  wtab[3 * WTS + 1024 - i] = e;
+  i += 1;
+);
+k = 0;
+loop(4,
+  e = 0; i = 0; loop(1024, e += sqr(wtab[k * WTS + i]); i += 1; );
+  mw2[k] = e / 1024;
+  k += 1;
+);
+
+// ---- tank line
+function tk_init(k) instance(buf, tb, wf, lc, ls, lp, x, y, z1, z2, g, ge, r, re) (
+  buf = tbase + k * TSZ; tb = tr[k]; wf = tw[k]; lc = cos(tp[k]); ls = sin(tp[k]);
+  lp = 0; x = 0; y = 0; z1 = 0; z2 = 0; g = 0; ge = 0; r = 0; re = 0;
+);
+function tk_block() instance(tb, lc, ls, wc, ws, wf, g, ge, dg, r, re, dr) local(gd, h, a) (
+  g = ge; r = re;
+  gd = 10 ^ (-3 * tb * sfe / (p_decay * srate));
+  h = gd * gd * gd;                    // above Damping: four times the decay rate
+  ge = min(1, gd + (1 - gd) * phe);
+  re = min(1, h + (1 - h) * phe);
+  first ? ( g = ge; r = re; );
+  dg = (ge - g) / bs; dr = (re - r) / bs;
+  a = 2 * $pi * p_mrate * wf / srate; wc = cos(a); ws = sin(a);
+  a = 1 / sqrt(lc * lc + ls * ls); lc *= a; ls *= a;
+);
+function tk_read() instance(buf, tb, lc, ls, wc, ws, x, z1, z2) local(t, d, m, q, a1, a2) (
+  t = lc * wc - ls * ws; ls = ls * wc + lc * ws; lc = t;
+  d = tb * sf + ls * mdep;
+  m = floor(d - 1.5); d -= m;          // whole samples m, and 1.5 <= d < 2.5 for the allpass
+  t = 1 / ((d + 1) * (d + 2));
+  a1 = -2 * (d - 2) * (d + 2) * t; a2 = (d - 1) * (d - 2) * t;
+  q = wpos - m;
+  x = a2 * buf[q & TMSK] + a1 * buf[(q - 1) & TMSK] + buf[(q - 2) & TMSK] - a1 * z1 - a2 * z2;
+  z2 = z1; z1 = x;
+);
+function tk_damp() instance(x, y, lp, g, dg, r, dr) (
+  lp += dcoef * (x - lp);
+  y = g * (lp + r * (x - lp));
+  g += dg; r += dr;
+);
+function tk_write(v) instance(buf, y) ( buf[wpos] = 0.25 * y + v; );
+
+// ---- diffuser channel
+function df_init(k) instance(buf, fr, sg, cur, endv, inc) (
+  buf = dbase + k * DSZ; fr = dfr[k]; sg = dsg[k]; cur = 0; endv = 0; inc = 0;
+);
+function df_block() instance(cur, endv, inc, fr) local(tg, st) (
+  cur = endv;
+  tg = floor(fr * dtime + 0.5);
+  first ? (cur = tg);
+  st = max(-0.25 * bs, min(0.25 * bs, (tg - cur) * kb));
+  endv = abs(tg - cur - st) < 0.5 ? tg : cur + st;
+  inc = (endv - cur) / bs;
+);
+function df_run(v) instance(buf, cur, inc, sg) local(di, f, q, a) (
+  buf[dpos] = v;
+  di = floor(cur); f = cur - di;
+  q = dpos - di;
+  a = buf[q & DMSK];
+  cur += inc;
+  sg * (a + f * (buf[(q - 1) & DMSK] - a));
+);
+function had8() local(t) (
+  t = a0; a0 = t + a1; a1 = t - a1; t = a2; a2 = t + a3; a3 = t - a3;
+  t = a4; a4 = t + a5; a5 = t - a5; t = a6; a6 = t + a7; a7 = t - a7;
+  t = a0; a0 = t + a2; a2 = t - a2; t = a1; a1 = t + a3; a3 = t - a3;
+  t = a4; a4 = t + a6; a6 = t - a6; t = a5; a5 = t + a7; a7 = t - a7;
+  t = a0; a0 = t + a4; a4 = t - a4; t = a1; a1 = t + a5; a5 = t - a5;
+  t = a2; a2 = t + a6; a6 = t - a6; t = a3; a3 = t + a7; a7 = t - a7;
+  a0 *= HS8; a1 *= HS8; a2 *= HS8; a3 *= HS8; a4 *= HS8; a5 *= HS8; a6 *= HS8; a7 *= HS8;
+);
+
+// ---- 2-pole state-variable filters (TPT), Q 0.707
+function svf_hp(v) instance(ic1, ic2) local(v1, v2, v3) (
+  v3 = v - ic2; v1 = ha1 * ic1 + ha2 * v3; v2 = ic2 + ha2 * ic1 + ha3 * v3;
+  ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+  v - SQ2 * v1 - v2;
+);
+function svf_lp(v) instance(ic1, ic2) local(v1, v2, v3) (
+  v3 = v - ic2; v1 = la1 * ic1 + la2 * v3; v2 = ic2 + la2 * ic1 + la3 * v3;
+  ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+  v2;
+);
+function svf_reset() instance(ic1, ic2) ( ic1 = 0; ic2 = 0; );
+
+// ---- grains
+function grain_semis() local(x, o, rr) (
+  x = (2 * rnd01() - 1) * p_grand;
+  p_gquant == 1 ? (x = floor(x + 0.5));
+  p_gquant == 2 ? (o = floor(x / 12); rr = x - 12 * o; x = 12 * o + (rr < 3.5 ? 0 : (rr < 9.5 ? 7 : 12)));
+  p_gquant == 3 ? (x = 12 * floor(x / 12 + 0.5));
+  max(-24, min(24, p_gpitch + x));
+);
+function gr_reset() instance(on) ( on = 0; );
+function gr_try(k) instance(on, pos, stp, ph, dph, gl, gr, wb) local(len, ratio, off, a) (
+  k == gtarget && !on ? (
+    len = glen * (0.85 + 0.3 * rnd01());
+    ratio = 2 ^ (grain_semis() / 12);
+    rnd01() * 100 < p_grev ? (
+      stp = -ratio; off = 4 + rnd01() * gspr;
+    ) : (
+      stp = ratio; off = max(4, (ratio - 1) * len + 4) + rnd01() * gspr;
+    );
+    pos = gw - off; pos < 0 ? (pos += GSZ);
+    ph = 0; dph = 1 / len;
+    a = (1 + (2 * rnd01() - 1) * p_gspread / 100) * $pi / 4;
+    gl = cos(a) * gnorm; gr = sin(a) * gnorm;
+    wb = gwb;
+    on = 1; gactive += 1;
+    gnext = (k + 1) & 15;
+  );
+);
+function gr_run() instance(on, pos, stp, ph, dph, gl, gr, wb) local(ip, f, y0, y1, y2, y3, c1, c2, c3, s, wi, wk) (
+  on ? (
+    ip = floor(pos); f = pos - ip;
+    y0 = gbase[(ip - 1) & GMSK]; y1 = gbase[ip & GMSK]; y2 = gbase[(ip + 1) & GMSK]; y3 = gbase[(ip + 2) & GMSK];
+    c1 = 0.5 * (y2 - y0); c3 = 1.5 * (y1 - y2) + 0.5 * (y3 - y0); c2 = y0 - y1 + c1 - c3;
+    wi = ph * 1024; wk = floor(wi);
+    s = (((c3 * f + c2) * f + c1) * f + y1) * (wb[wk] + (wi - wk) * (wb[wk + 1] - wb[wk]));
+    gsl += s * gl; gsr += s * gr;
+    pos += stp; pos >= GSZ ? (pos -= GSZ) : (pos < 0 ? (pos += GSZ));
+    ph += dph;
+    ph >= 1 ? (on = 0; gactive -= 1);
+  );
+);
+
+function read_sliders() (
+  p_size = min(100, max(0, s_size));
+  p_decay = min(100, max(0.1, s_decay));
+  p_pre = min(500, max(0, s_pre));
+  p_diff = min(100, max(0, s_diff));
+  p_mdepth = min(100, max(0, s_mdepth));
+  p_mrate = min(5, max(0.05, s_mrate));
+  p_damp = min(20000, max(500, s_damp));
+  p_lcut = min(2000, max(20, s_lcut));
+  p_hcut = min(20000, max(500, s_hcut));
+  p_width = min(100, max(0, s_width));
+  p_freeze = s_freeze >= 0.5;
+  p_mix = min(100, max(0, s_mix));
+  p_out = min(24, max(-24, s_out));
+  p_grains = min(2, max(0, floor(s_grains + 0.5)));
+  p_gsrc = s_gsrc >= 0.5;
+  p_gsize = min(1000, max(10, s_gsize));
+  p_gdens = min(50, max(1, s_gdens));
+  p_gspray = min(2000, max(0, s_gspray));
+  p_gpitch = min(24, max(-24, s_gpitch));
+  p_grand = min(24, max(0, s_grand));
+  p_gquant = min(3, max(0, floor(s_gquant + 0.5)));
+  p_grev = min(100, max(0, s_grev));
+  p_gshape = min(3, max(0, floor(s_gshape + 0.5)));
+  p_gspread = min(100, max(0, s_gspread));
+  p_gmix = min(100, max(0, s_gmix));
+  p_gfb = min(100, max(0, s_gfb));
+);
+read_sliders();
+
+l0.tk_init(0); l1.tk_init(1); l2.tk_init(2); l3.tk_init(3); l4.tk_init(4); l5.tk_init(5); l6.tk_init(6); l7.tk_init(7);
+l8.tk_init(8); l9.tk_init(9); l10.tk_init(10); l11.tk_init(11); l12.tk_init(12); l13.tk_init(13); l14.tk_init(14); l15.tk_init(15);
+d00.df_init(0); d01.df_init(1); d02.df_init(2); d03.df_init(3); d04.df_init(4); d05.df_init(5); d06.df_init(6); d07.df_init(7);
+d10.df_init(8); d11.df_init(9); d12.df_init(10); d13.df_init(11); d14.df_init(12); d15.df_init(13); d16.df_init(14); d17.df_init(15);
+d20.df_init(16); d21.df_init(17); d22.df_init(18); d23.df_init(19); d24.df_init(20); d25.df_init(21); d26.df_init(22); d27.df_init(23);
+d30.df_init(24); d31.df_init(25); d32.df_init(26); d33.df_init(27); d34.df_init(28); d35.df_init(29); d36.df_init(30); d37.df_init(31);
+v0.gr_reset(); v1.gr_reset(); v2.gr_reset(); v3.gr_reset(); v4.gr_reset(); v5.gr_reset(); v6.gr_reset(); v7.gr_reset();
+v8.gr_reset(); v9.gr_reset(); v10.gr_reset(); v11.gr_reset(); v12.gr_reset(); v13.gr_reset(); v14.gr_reset(); v15.gr_reset();
+hpl.svf_reset(); hpr.svf_reset(); lpl.svf_reset(); lpr.svf_reset();
+wpos = 0; dpos = 0; pw = 0; gw = 0;
+sf = 0; sfe = 0; mde = 0; pde = 0; phe = 0; oce = 0; gde = 0;
+dcx1 = 0; dcy1 = 0; dcx2 = 0; dcy2 = 0;
+gactive = 0; gnext = 0; gcount = 0; genv = 0; ienv = 0; gfl = 0; gfr = 0; gsl = 0; gsr = 0;
+
+@slider
+read_sliders();
+slider_show(2 ^ 25 - 2 ^ 14, p_grains > 0);   // sliders 15 to 25
+slider_show(2 ^ 25, p_grains == 1);          // slider 26, Grains into reverb
+ext_tail_size = p_freeze || (p_grains == 1 && p_gfb > 0) ? -1 :
+  ceil((p_pre / 1000 + 1.6 * p_decay + 0.1 + (p_grains ? p_gspray / 1000 + p_gsize / 1000 : 0)) * srate);
+
+@block
+bs = max(1, samplesblock);
+kb = 1 - exp(-bs / (0.15 * srate));
+kf = 1 - exp(-bs / (0.04 * srate));
+
+// size: the tank's mean delay in samples, 5 ms to 250 ms; the longest line (1.55 x) moves at most 1/4 sample per sample
+sf = sfe;
+t = 0.005 * 50 ^ (p_size / 100) * srate;
+first ? (sf = t);
+u = max(-0.16 * bs, min(0.16 * bs, (t - sf) * kb));
+sfe = abs(t - sf - u) < 0.001 ? t : sf + u;
+sfi = (sfe - sf) / bs;
+
+// freeze: 0 to 1 over about 40 ms
+ph0 = first ? p_freeze : phe;
+phe = ph0 + (p_freeze - ph0) * kf;
+abs(p_freeze - phe) < 0.001 ? (phe = p_freeze);
+ig = 1 - ph0; igi = (ph0 - phe) / bs;
+
+// modulation depth: up to 2 ms, and at most a quarter of the shortest line
+t = p_mdepth / 100 * min(0.002 * srate, 0.1125 * sfe);
+md0 = first ? t : mde;
+mde = md0 + (t - md0) * kb;
+mdep = md0; mdi = (mde - md0) / bs;
+
+t = log(p_damp); ldp = first ? t : ldp + (t - ldp) * kb;
+dcoef = 1 - exp(-2 * $pi * exp(ldp) / srate);
+
+l0.tk_block(); l1.tk_block(); l2.tk_block(); l3.tk_block(); l4.tk_block(); l5.tk_block(); l6.tk_block(); l7.tk_block();
+l8.tk_block(); l9.tk_block(); l10.tk_block(); l11.tk_block(); l12.tk_block(); l13.tk_block(); l14.tk_block(); l15.tk_block();
+
+oc0 = oce;
+oce = 0.25 * (sfe / (0.035 * srate)) ^ 0.37;
+first ? (oc0 = oce);
+oc = oc0; oci = (oce - oc0) / bs;
+
+// pre-delay in whole samples once settled
+pd0 = pde;
+t = floor(p_pre / 1000 * srate + 0.5);
+first ? (pd0 = t);
+u = max(-0.25 * bs, min(0.25 * bs, (t - pd0) * kb));
+pde = abs(t - pd0 - u) < 0.5 ? t : pd0 + u;
+pdc = pd0; pdi = (pde - pd0) / bs;
+
+dtime = p_diff / 100 * sfe;
+d00.df_block(); d01.df_block(); d02.df_block(); d03.df_block(); d04.df_block(); d05.df_block(); d06.df_block(); d07.df_block();
+d10.df_block(); d11.df_block(); d12.df_block(); d13.df_block(); d14.df_block(); d15.df_block(); d16.df_block(); d17.df_block();
+d20.df_block(); d21.df_block(); d22.df_block(); d23.df_block(); d24.df_block(); d25.df_block(); d26.df_block(); d27.df_block();
+d30.df_block(); d31.df_block(); d32.df_block(); d33.df_block(); d34.df_block(); d35.df_block(); d36.df_block(); d37.df_block();
+
+// low cut and high cut: the cutoffs glide over 40 ms, and the coefficients move sample by sample
+ha1 = hae1; ha2 = hae2; ha3 = hae3; la1 = lae1; la2 = lae2; la3 = lae3;
+t = log(p_lcut); llc = first ? t : llc + (t - llc) * kf;
+t = tan($pi * min(exp(llc), 0.45 * srate) / srate); hae1 = 1 / (1 + t * (t + SQ2)); hae2 = t * hae1; hae3 = t * hae2;
+t = log(p_hcut); lhc = first ? t : lhc + (t - lhc) * kf;
+t = tan($pi * min(exp(lhc), 0.45 * srate) / srate); lae1 = 1 / (1 + t * (t + SQ2)); lae2 = t * lae1; lae3 = t * lae2;
+first ? ( ha1 = hae1; ha2 = hae2; ha3 = hae3; la1 = lae1; la2 = lae2; la3 = lae3; );
+hai1 = (hae1 - ha1) / bs; hai2 = (hae2 - ha2) / bs; hai3 = (hae3 - ha3) / bs;
+lai1 = (lae1 - la1) / bs; lai2 = (lae2 - la2) / bs; lai3 = (lae3 - la3) / bs;
+
+dgt = cos(p_mix / 100 * $pi / 2); wgt = sin(p_mix / 100 * $pi / 2);
+ogt = 10 ^ (p_out / 20);
+wdt = p_width / 100;
+t = p_gmix / 100 * (p_grains == 1 ? 1 : (p_grains == 2 ? phe : 0));
+rvt = cos(t * $pi / 2); grt = sin(t * $pi / 2);
+t = 4 * ienv / (genv + 0.0000000001);   // grains fed back hold the reverb at most 6 dB above the input
+gft = p_grains == 1 ? p_gfb / 100 * min(1, t * t) : 0;
+first ? ( dgn = dgt; wgn = wgt; ogn = ogt; wd = wdt; rvg = rvt; grg = grt; gfs = gft; );
+
+glen = p_gsize / 1000 * srate;
+gspr = p_gspray / 1000 * srate;
+gint = srate / p_gdens;
+t = min(16, p_gdens * p_gsize / 1000) * mw2[p_gshape];
+gnorm = SQ2 * min(1, 1 / sqrt(max(t, 0.000001)));
+gspawn = p_grains == 1 || (p_grains == 2 && phe > 0.01);
+gwb = wtab + p_gshape * WTS;
+
+// guard: holds the reverb at -9 dBFS RMS at most
+gd0 = first ? 1 : gde;
+t = 0.1225 / (genv + 0.0000000001);   // (0.35 / rms)^2
+gde = min(1, t * t);                  // turned down 4 dB per dB above, so feedback settles close to the limit
+gdg = gd0; gdi = (gde - gd0) / bs;
+
+first = 0;
+
+@sample
+inl = spl0; inr = spl1;
+t = 0.5 * (inl * inl + inr * inr);
+ienv += (t - ienv) * (t > ienv ? KIA : KIR);
+
+// pre-delay
+pbase[pw] = inl; pbase[PSZ + pw] = inr;
+di = floor(pdc); f = pdc - di; q = (pw - di) & PMSK; q1 = (q - 1) & PMSK;
+xl = pbase[q] + f * (pbase[q1] - pbase[q]);
+xr = pbase[PSZ + q] + f * (pbase[PSZ + q1] - pbase[PSZ + q]);
+pw = (pw + 1) & PMSK; pdc += pdi;
+
+// grains fed back from the last sample, then the DC blocker
+xl += gfl; xr += gfr;
+yl = xl - dcx1 + DCR * dcy1; dcx1 = xl; dcy1 = yl;
+yr = xr - dcx2 + DCR * dcy2; dcx2 = xr; dcy2 = yr;
+
+// diffuser
+a0 = 0.5 * yl; a1 = 0.5 * yr; a2 = a0; a3 = a1; a4 = a0; a5 = a1; a6 = a0; a7 = a1;
+a0 = d00.df_run(a0); a1 = d01.df_run(a1); a2 = d02.df_run(a2); a3 = d03.df_run(a3);
+a4 = d04.df_run(a4); a5 = d05.df_run(a5); a6 = d06.df_run(a6); a7 = d07.df_run(a7); had8();
+a0 = d10.df_run(a0); a1 = d11.df_run(a1); a2 = d12.df_run(a2); a3 = d13.df_run(a3);
+a4 = d14.df_run(a4); a5 = d15.df_run(a5); a6 = d16.df_run(a6); a7 = d17.df_run(a7); had8();
+a0 = d20.df_run(a0); a1 = d21.df_run(a1); a2 = d22.df_run(a2); a3 = d23.df_run(a3);
+a4 = d24.df_run(a4); a5 = d25.df_run(a5); a6 = d26.df_run(a6); a7 = d27.df_run(a7); had8();
+a0 = d30.df_run(a0); a1 = d31.df_run(a1); a2 = d32.df_run(a2); a3 = d33.df_run(a3);
+a4 = d34.df_run(a4); a5 = d35.df_run(a5); a6 = d36.df_run(a6); a7 = d37.df_run(a7); had8();
+dpos = (dpos + 1) & DMSK;
+
+// tank
+l0.tk_read(); l1.tk_read(); l2.tk_read(); l3.tk_read(); l4.tk_read(); l5.tk_read(); l6.tk_read(); l7.tk_read();
+l8.tk_read(); l9.tk_read(); l10.tk_read(); l11.tk_read(); l12.tk_read(); l13.tk_read(); l14.tk_read(); l15.tk_read();
+revl = oc * (l0.x - l1.x + l2.x - l3.x + l4.x - l5.x + l6.x - l7.x + l8.x - l9.x + l10.x - l11.x + l12.x - l13.x + l14.x - l15.x);
+revr = oc * (l0.x + l1.x - l2.x - l3.x + l4.x + l5.x - l6.x - l7.x + l8.x + l9.x - l10.x - l11.x + l12.x + l13.x - l14.x - l15.x);
+l0.tk_damp(); l1.tk_damp(); l2.tk_damp(); l3.tk_damp(); l4.tk_damp(); l5.tk_damp(); l6.tk_damp(); l7.tk_damp();
+l8.tk_damp(); l9.tk_damp(); l10.tk_damp(); l11.tk_damp(); l12.tk_damp(); l13.tk_damp(); l14.tk_damp(); l15.tk_damp();
+t = l0.y; l0.y = t + l1.y; l1.y = t - l1.y; t = l2.y; l2.y = t + l3.y; l3.y = t - l3.y;
+t = l4.y; l4.y = t + l5.y; l5.y = t - l5.y; t = l6.y; l6.y = t + l7.y; l7.y = t - l7.y;
+t = l8.y; l8.y = t + l9.y; l9.y = t - l9.y; t = l10.y; l10.y = t + l11.y; l11.y = t - l11.y;
+t = l12.y; l12.y = t + l13.y; l13.y = t - l13.y; t = l14.y; l14.y = t + l15.y; l15.y = t - l15.y;
+t = l0.y; l0.y = t + l2.y; l2.y = t - l2.y; t = l1.y; l1.y = t + l3.y; l3.y = t - l3.y;
+t = l4.y; l4.y = t + l6.y; l6.y = t - l6.y; t = l5.y; l5.y = t + l7.y; l7.y = t - l7.y;
+t = l8.y; l8.y = t + l10.y; l10.y = t - l10.y; t = l9.y; l9.y = t + l11.y; l11.y = t - l11.y;
+t = l12.y; l12.y = t + l14.y; l14.y = t - l14.y; t = l13.y; l13.y = t + l15.y; l15.y = t - l15.y;
+t = l0.y; l0.y = t + l4.y; l4.y = t - l4.y; t = l1.y; l1.y = t + l5.y; l5.y = t - l5.y;
+t = l2.y; l2.y = t + l6.y; l6.y = t - l6.y; t = l3.y; l3.y = t + l7.y; l7.y = t - l7.y;
+t = l8.y; l8.y = t + l12.y; l12.y = t - l12.y; t = l9.y; l9.y = t + l13.y; l13.y = t - l13.y;
+t = l10.y; l10.y = t + l14.y; l14.y = t - l14.y; t = l11.y; l11.y = t + l15.y; l15.y = t - l15.y;
+t = l0.y; l0.y = t + l8.y; l8.y = t - l8.y; t = l1.y; l1.y = t + l9.y; l9.y = t - l9.y;
+t = l2.y; l2.y = t + l10.y; l10.y = t - l10.y; t = l3.y; l3.y = t + l11.y; l11.y = t - l11.y;
+t = l4.y; l4.y = t + l12.y; l12.y = t - l12.y; t = l5.y; l5.y = t + l13.y; l13.y = t - l13.y;
+t = l6.y; l6.y = t + l14.y; l14.y = t - l14.y; t = l7.y; l7.y = t + l15.y; l15.y = t - l15.y;
+t = 0.70710678 * ig * gdg;
+gdg += gdi;
+a0 *= t; a1 *= t; a2 *= t; a3 *= t; a4 *= t; a5 *= t; a6 *= t; a7 *= t;
+l0.tk_write(a0); l1.tk_write(a1); l2.tk_write(a2); l3.tk_write(a3); l4.tk_write(a4); l5.tk_write(a5); l6.tk_write(a6); l7.tk_write(a7);
+l8.tk_write(-a0); l9.tk_write(-a1); l10.tk_write(-a2); l11.tk_write(-a3); l12.tk_write(-a4); l13.tk_write(-a5); l14.tk_write(-a6); l15.tk_write(-a7);
+wpos = (wpos + 1) & TMSK;
+sf += sfi; mdep += mdi; ig += igi; oc += oci;
+
+// grains
+t = 0.5 * (revl * revl + revr * revr);
+genv += (t - genv) * KENV;
+gbase[gw] = 0.70710678 * (p_gsrc ? inl + inr : revl + revr);
+gw = (gw + 1) & GMSK;
+gsl = 0; gsr = 0;
+gactive > 0 ? (
+  v0.gr_run(); v1.gr_run(); v2.gr_run(); v3.gr_run(); v4.gr_run(); v5.gr_run(); v6.gr_run(); v7.gr_run();
+  v8.gr_run(); v9.gr_run(); v10.gr_run(); v11.gr_run(); v12.gr_run(); v13.gr_run(); v14.gr_run(); v15.gr_run();
+);
+gcount -= 1;
+gcount <= 0 ? (
+  gspawn ? (
+    gtarget = gnext;
+    v0.gr_try(0); v1.gr_try(1); v2.gr_try(2); v3.gr_try(3); v4.gr_try(4); v5.gr_try(5); v6.gr_try(6); v7.gr_try(7);
+    v8.gr_try(8); v9.gr_try(9); v10.gr_try(10); v11.gr_try(11); v12.gr_try(12); v13.gr_try(13); v14.gr_try(14); v15.gr_try(15);
+  );
+  gcount = max(gcount, 0) + gint * (0.5 + rnd01());
+);
+gfs += (gft - gfs) * KS;
+gfl = gsl * gfs; gfr = gsr * gfs;
+
+// wet: reverb and grains, width, low cut, high cut
+rvg += (rvt - rvg) * KS; grg += (grt - grg) * KS; wd += (wdt - wd) * KS;
+wl = revl * rvg + gsl * grg; wr = revr * rvg + gsr * grg;
+t = 0.5 * (wl + wr); u = 0.5 * (wl - wr) * wd; wl = t + u; wr = t - u;
+wl = lpl.svf_lp(hpl.svf_hp(wl)); wr = lpr.svf_lp(hpr.svf_hp(wr));
+ha1 += hai1; ha2 += hai2; ha3 += hai3; la1 += lai1; la2 += lai2; la3 += lai3;
+
+dgn += (dgt - dgn) * KS; wgn += (wgt - wgn) * KS; ogn += (ogt - ogn) * KS;
+spl0 = ogn * (dgn * inl + wgn * wl);
+spl1 = ogn * (dgn * inr + wgn * wr);
