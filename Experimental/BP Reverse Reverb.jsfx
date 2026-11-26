@@ -1,0 +1,569 @@
+desc:BP Reverse Reverb
+author: Blind Producers
+version: 1.3
+tags: reverb reverse swell delay echo tremolo filter
+changelog:
+  Initial release
+about:
+  Plays a reverse reverb swell before every item on its track. The swell rises into the item's first sound and fades out just after it, in sync with the project.
+  - Select the track that holds the items and run Track: Prevent track media buffering. Without it, swells in the first seconds after you press Play stay silent.
+  - At 100 % Dry/wet, the default, only the swells play: put it on a copy of the items' track or on a send.
+  - Each item needs at least 5 ms of silence before it.
+  - Pre-echoes, a tempo-synced tremolo and a filter sweep can build into each item.
+  - The latency is as long as the swell, up to 5.3 s at 48 kHz, so don't monitor live input through it.
+
+slider1:sync=0<0,1,1{Tempo,Milliseconds}>Sync
+slider2:len_note=6<0,7,1{1/16,1/8,1/8 dotted,1/4,1/4 dotted,1/2,1 bar,2 bars}>Length
+slider3:len_ms=1000<50,5000,1>Length (ms)
+slider4:fade_in=100<0,100,0.1>Fade in (%)
+slider5:fade_out=150<0,2000,1>Fade out (ms)
+slider6:overlap=150<0,2000,1>Overlap (ms)
+slider7:decay=3<0.3,10,0.01>Decay (s)
+slider8:damping=50<0,100,1>Damping (%)
+slider9:low_cut=150<20,1000,1:log>Low cut (Hz)
+slider10:width=100<0,100,1>Width (%)
+slider11:rev_db=0<-60,12,0.1>Reverb level (dB)
+slider12:mix=100<0,100,0.1>Dry/wet (%)
+slider13:thr_db=-80<-120,-30,1>Threshold (dB)
+slider14:echo_div=3<0,8,1{1/16,1/8 triplet,1/16 dotted,1/8,1/4 triplet,1/8 dotted,1/4,1/4 dotted,1/2}>Delay time
+slider15:echo_fb=50<0,100,1>Delay feedback (%)
+slider16:echo_lvl=0<0,100,0.1>Delay level (%)
+slider17:trem_div=5<0,7,1{1/4,1/8,1/8 triplet,1/16,1/16 triplet,1/32,1/32 triplet,1/64}>Tremolo rate
+slider18:trem_dep=0<0,100,0.1>Tremolo depth (%)
+slider19:pingpong=0<0,1,1{Off,On}>Ping-pong echoes
+slider20:sweep=0<0,100,0.1>Filter sweep (%)
+
+options:maxmem=4194304
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// How it works. The plugin reports a latency (DLY) at least as long as the swell, so REAPER
+// feeds it the audio that long before it plays. REAPER compensates at most 256000 samples,
+// which caps the swell and the part of the tail in use. The reverse reverb before an onset at T is
+// w(t) = sum over u of h(u) * x(t + u), the reverb tail h run backwards over the audio that
+// follows t. That is a plain convolution with the reversed tail, done here with uniformly
+// partitioned FFT convolution. An onset is sound after at least 5 ms of silence; the swell
+// passes only inside that silence, during the Length before the onset, and then for Overlap
+// into the sound while it fades out.
+//
+// The delay adds pre-echoes the same way: echo k plays the audio k delay times later, so the
+// echoes of an onset come before it and grow toward it, like reversing, delaying and
+// reversing back. They are read from the dry ring, which already holds the lookahead. The
+// tremolo dips the swell and the echoes in time with the tempo, at full level on each onset.
+// Ping-pong sums the echoes to mono and alternates them left and right. The filter sweep is a
+// low-pass on the swell and the echoes that opens over the swell and is fully open at the onset.
+//
+// Variables persist across @init calls because @serialize exists, so @init only rebuilds
+// the reverb on load or a sample rate change. On playback start and seeks it resets the stream.
+
+BS = 16384;                 // partition (block) size
+FS = 32768;                 // FFT size
+RN = 4096; RMASK = 4095;    // onset ring
+PM_M = 2147483647;          // Park-Miller modulus
+
+function smooth01(x) ( x * x * (3 - 2 * x); );
+
+function rate_init() (
+  cur_sr = srate;
+  DMAX = 256000;                           // the most latency REAPER compensates, at any rate
+  LS_MAX = DMAX - 16;                      // longest swell
+  JMAX = floor((DMAX - 2 * BS + 1) / BS);  // most tail segments the latency leaves room for
+  N_MAX = JMAX * BS;                       // longest tail in use
+  PLMAX = JMAX + 1;
+  WBMAX = ceil(DMAX / BS) + 3;
+  // FFT buffers first, each on a multiple of FS so none crosses a 65536 boundary
+  ACCL = 0; ACCR = FS;
+  FDL = 2 * FS;                            // input spectra, PLMAX slots
+  IRS = FDL + PLMAX * FS;                  // reverb spectra: 2 sets x 2 channels x JMAX slots
+  INR = IRS + 4 * JMAX * FS;               // mono input, 4 blocks
+  DRYL = INR + 4 * BS; DRYR = DRYL + DMAX + 1;
+  WETL = DRYR + DMAX + 1; WETR = WETL + WBMAX * BS;
+  WSC = WETR + WBMAX * BS;                 // output scale per wet block
+  NZ = WSC + WBMAX;                        // input spectrum slot is not silent
+  REC_T = NZ + PLMAX; REC_W = REC_T + RN; REC_L = REC_W + RN;
+  hold_n = floor(0.005 * srate);
+  ac_n = floor(0.003 * srate);
+  sm_k = 1 - exp(-1 / (0.02 * srate));
+  xf_n = floor(0.02 * srate);              // crossfade when the delay time or ping-pong changes
+  sw_k = 1 - exp(-16 / (0.01 * srate));    // sweep cutoff smoothing, run every 16 samples
+  lf_end = log(min(20000, 0.45 * srate));  // the sweep ends fully open
+  ln500 = log(500);                        // at 100 % it starts 500 times lower: 40 Hz
+  pi_sr = $pi / srate;
+  bk1 = 2 * cos($pi / 8); bk2 = 2 * cos(3 * $pi / 8);   // Butterworth damping of the two stages
+  act_set = 0; j_act = 0; ir_gain = 0;
+  building = 0; swap_pending = 0; req_decay = -1;
+);
+
+function update_params() (
+  slider_show(2, sync == 0);
+  slider_show(4, sync == 1);
+  fi_frac = fade_in * 0.01;
+  fo_n = max(floor(fade_out * 0.001 * srate), ac_n);
+  ov_n = floor(overlap * 0.001 * srate);
+  wet_t = mix * 0.01;
+  dry_t = 1 - mix * 0.01;
+  rv_t = 10 ^ (rev_db / 20);
+  el_t = echo_lvl * 0.01;
+  e_fb = echo_fb * 0.01;
+  td_t = trem_dep * 0.01;
+  sw_amt = sweep * 0.01;
+  thr = 10 ^ (thr_db / 20);
+);
+
+function cur_tempo() ( saved_tempo > 0 ? saved_tempo : 120; );
+
+function note_samples(q) ( q * 60 / cur_tempo() * srate; );
+
+// Delay time and tremolo rate follow the tempo. A new delay time or ping-pong setting
+// crossfades in during playback.
+function update_tempo_fx() local(q, dt) (
+  q = echo_div == 0 ? 0.25 : echo_div == 1 ? 1 / 3 : echo_div == 2 ? 0.375 : echo_div == 3 ? 0.5 :
+      echo_div == 4 ? 2 / 3 : echo_div == 5 ? 0.75 : echo_div == 6 ? 1 : echo_div == 7 ? 1.5 : 2;
+  dt = note_samples(q);
+  !(play_state & 1) ? (
+    d_a = d_b = dt; pp_a = pp_b = pingpong; xf_left = 0;
+  ) : xf_left == 0 && (dt != d_a || pingpong != pp_a) ? (
+    d_b = dt; pp_b = pingpong; xf_left = xf_n;
+  );
+  q = trem_div == 0 ? 1 : trem_div == 1 ? 0.5 : trem_div == 2 ? 1 / 3 : trem_div == 3 ? 0.25 :
+      trem_div == 4 ? 1 / 6 : trem_div == 5 ? 0.125 : trem_div == 6 ? 1 / 12 : 0.0625;
+  trem_w = 2 * $pi / note_samples(q);
+);
+
+function len_seconds() local(bq, q) (
+  sync == 1 ? len_ms * 0.001 : (
+    bq = saved_tsn > 0 && saved_tsd > 0 ? saved_tsn * 4 / saved_tsd : 4;
+    q = len_note == 0 ? 0.25 : len_note == 1 ? 0.5 : len_note == 2 ? 0.75 :
+        len_note == 3 ? 1 : len_note == 4 ? 1.5 : len_note == 5 ? 2 :
+        len_note == 6 ? bq : 2 * bq;
+    q * 60 / cur_tempo();
+  );
+);
+
+function swell_samples() ( min(ceil(len_seconds() * srate), LS_MAX); );
+
+function tail_samples() ( min(ceil(decay * srate), N_MAX); );
+
+function target_dly() (
+  min(max(swell_samples() + 16, (ceil(tail_samples() / BS) + 2) * BS), DMAX);
+);
+
+// ---------------- reverb tail ----------------
+// Two independent noise tails with an exponential decay to -60 dB at Decay, a low-pass that
+// closes over time (Damping), a 12 dB/oct low cut and mid/side width. A tail longer than the
+// latency allows is cut short with a fade. Each BS segment is stored
+// time-reversed and zero-padded to FS, then transformed. The noise is seeded, so every build of
+// the same settings is identical.
+
+function ir_slot(set, ch, j) ( IRS + ((set * 2 + ch) * JMAX + j) * FS; );
+
+function ir_build_start() local(full, fhi, flo) (
+  req_decay = decay; req_damp = damping; req_low = low_cut; req_width = width;
+  swap_pending = 0;                        // a finished build not yet in use is replaced
+  b_set = 1 - act_set;
+  b_n = tail_samples();
+  b_j = ceil(b_n / BS);
+  b_u = 0; b_r = 0; b_seg = 0; b_phase = 0; b_fj = 0; b_e = 0;
+  b_sl = 1234567; b_sr = 7654321;
+  lpa_l = lpb_l = lpa_r = lpb_r = 0;
+  hpa_l = hpb_l = hpa_r = hpb_r = 0;
+  full = decay * srate;                    // the tail's full length; b_n may be shorter
+  b_env = 1; b_dec = exp(-6.907755279 / full);
+  // Damping darkens the start of the tail and how fast it closes: at 50 % the low-pass starts
+  // at 9 kHz and reaches 2.3 kHz at Decay; at 0 % it stays open
+  fhi = min(18000, 0.45 * srate) * 0.25 ^ (damping * 0.01);
+  flo = fhi * (1 / 15) ^ (damping * 0.01);
+  b_lf0 = log(fhi); b_lfd = (log(flo) - b_lf0) / full;
+  b_wk = -2 * $pi / srate;
+  b_hc = 1 - exp(-2 * $pi * low_cut / srate);
+  b_ons = max(1, floor(0.012 * srate));
+  b_tap = max(1, floor(0.02 * b_n));
+  b_w = width * 0.01;
+  building = 1;
+);
+
+function ir_build_gen(count) local(a, nl, nr, x1, yl, yr, e, mid, side, ol, orr) (
+  loop(min(count, b_n - b_u),
+    b_r == 0 ? (
+      b_bl = ir_slot(b_set, 0, b_seg); b_br = ir_slot(b_set, 1, b_seg);
+      memset(b_bl, 0, FS); memset(b_br, 0, FS);
+    );
+    b_sl *= 16807; b_sl -= floor(b_sl / PM_M) * PM_M;
+    b_sl < 0 ? (b_sl += PM_M) : b_sl >= PM_M ? (b_sl -= PM_M);
+    b_sr *= 16807; b_sr -= floor(b_sr / PM_M) * PM_M;
+    b_sr < 0 ? (b_sr += PM_M) : b_sr >= PM_M ? (b_sr -= PM_M);
+    nl = b_sl * (2 / PM_M) - 1;
+    nr = b_sr * (2 / PM_M) - 1;
+    a = 1 - exp(b_wk * exp(b_lf0 + b_lfd * b_u));
+    lpa_l += a * (nl - lpa_l); lpb_l += a * (lpa_l - lpb_l);
+    lpa_r += a * (nr - lpa_r); lpb_r += a * (lpa_r - lpb_r);
+    hpa_l += b_hc * (lpb_l - hpa_l); x1 = lpb_l - hpa_l; hpb_l += b_hc * (x1 - hpb_l); yl = x1 - hpb_l;
+    hpa_r += b_hc * (lpb_r - hpa_r); x1 = lpb_r - hpa_r; hpb_r += b_hc * (x1 - hpb_r); yr = x1 - hpb_r;
+    e = b_env;
+    b_u < b_ons ? e *= smooth01(b_u / b_ons);
+    b_u > b_n - b_tap ? e *= smooth01((b_n - b_u) / b_tap);
+    b_env *= b_dec;
+    mid = 0.5 * (yl + yr); side = 0.5 * (yl - yr) * b_w;
+    ol = (mid + side) * e; orr = (mid - side) * e;
+    b_e += ol * ol + orr * orr;
+    b_bl[BS - 1 - b_r] = ol; b_br[BS - 1 - b_r] = orr;
+    b_u += 1;
+    (b_r += 1) >= BS ? ( b_r = 0; b_seg += 1; );
+  );
+  b_u >= b_n ? b_phase = 1;
+);
+
+function ir_build_fft(count) (
+  loop(count,
+    b_fj < b_j ? (
+      fft_real(ir_slot(b_set, 0, b_fj), FS);
+      fft_real(ir_slot(b_set, 1, b_fj), FS);
+      b_fj += 1;
+    );
+  );
+  b_fj >= b_j ? (
+    done_set = b_set; done_j = b_j;
+    done_gain = 1 / sqrt(max(0.5 * b_e, 0.000000000001));
+    swap_pending = 1; building = 0;
+  );
+);
+
+function ir_swap() (
+  act_set = done_set; j_act = done_j; ir_gain = done_gain; swap_pending = 0;
+);
+
+function ir_build_now() (
+  while (building && b_phase == 0) ( ir_build_gen(65536); );
+  building ? ir_build_fft(b_j);
+  ir_swap();
+);
+
+function ir_changed() (
+  req_decay != decay || req_damp != damping || req_low != low_cut || req_width != width;
+);
+
+// ---------------- stream ----------------
+
+function stream_reset() (
+  memset(INR, 0, 4 * BS);
+  memset(DRYL, 0, DRN); memset(DRYR, 0, DRN);
+  memset(WETL, 0, WRN); memset(WETR, 0, WRN); memset(WSC, 0, WB);
+  memset(NZ, 0, PLN);
+  pos_n = 0; ip = 0; dw = 0; ph = 0; kblk = 0; head = PLN - 1;
+  st = 0; next_step = 0; need = 0; j_eff = 0; any_mac = 0;
+  silent = 1; run_start = 0; rhead = 0; rtail = 0;
+  wrp = CLEN - 1 - DLY + WRN; wrp >= WRN ? wrp -= WRN;
+);
+
+function set_latency(dn) (
+  DLY = dn;
+  pdc_delay = DLY; pdc_bot_ch = 0; pdc_top_ch = 2;
+  PL = floor((DLY - 2 * BS + 1) / BS);     // partitions the latency leaves room for
+  CLEN = PL * BS;                          // wet(t) = conv(t + CLEN - 1)
+  PLN = PL + 1;
+  DRN = DLY + 1;
+  WB = ceil(DLY / BS) + 3; WRN = WB * BS;
+  stream_reset();
+);
+
+function push_onset() local(nx, ls) (
+  nx = (rhead + 1) & RMASK;
+  nx != rtail ? (
+    ls = min(ls_n, DLY - 16);
+    REC_T[rhead] = pos_n;
+    REC_W[rhead] = max(run_start, pos_n - ls);
+    REC_L[rhead] = ls;
+    rhead = nx;
+  );
+);
+
+// Can any output time in [lo, hi] fall inside a swell or its overlap? A block of wet that
+// lies wholly within sound, away from onsets, is never computed.
+function block_needed(lo, hi) local(r, ok) (
+  ok = silent && run_start <= hi;
+  r = rtail;
+  while (!ok && r != rhead) (
+    REC_W[r] <= hi && REC_T[r] + ov_n > lo ? ok = 1;
+    r = (r + 1) & RMASK;
+  );
+  ok;
+);
+
+function frame_start() local(slot, m) (
+  swap_pending ? ir_swap();
+  (head += 1) >= PLN ? head = 0;
+  slot = FDL + head * FS;
+  memcpy(slot, INR + ((kblk + 2) & 3) * BS, BS);
+  memcpy(slot + BS, INR + ((kblk + 3) & 3) * BS, BS);
+  mem_multiply_sum(slot, slot, FS) > 0.000000000000000001 ? (
+    fft_real(slot, FS); NZ[head] = 1;
+  ) : ( NZ[head] = 0; );
+  m = kblk - 1;
+  need = block_needed(m * BS - CLEN + 1, (m + 1) * BS - CLEN);
+  j_eff = min(j_act, PL);
+  any_mac = 0;
+  need && j_eff > 0 ? (
+    memset(ACCL, 0, 2 * FS);
+    stride = floor((BS - 2) / j_eff);
+    st = 1; next_step = 1;
+  ) : (
+    st = j_eff + 1; next_step = BS - 1;
+  );
+);
+
+// Accumulate tail segment jj (time order) against the input spectrum it pairs with.
+function mac(jj) local(q, sx, gl, gr, i, xre, xim, cre, cim) (
+  q = head - (PL - 1 - jj); q < 0 ? q += PLN;
+  NZ[q] ? (
+    any_mac = 1;
+    sx = FDL + q * FS;
+    gl = ir_slot(act_set, 0, jj); gr = gl + JMAX * FS;
+    ACCL[0] += sx[0] * gl[0]; ACCL[1] += sx[1] * gl[1];   // DC and Nyquist are real
+    ACCR[0] += sx[0] * gr[0]; ACCR[1] += sx[1] * gr[1];
+    i = 2;
+    loop(BS - 1,
+      xre = sx[i]; xim = sx[i + 1];
+      cre = gl[i]; cim = gl[i + 1];
+      ACCL[i] += xre * cre - xim * cim; ACCL[i + 1] += xre * cim + xim * cre;
+      cre = gr[i]; cim = gr[i + 1];
+      ACCR[i] += xre * cre - xim * cim; ACCR[i + 1] += xre * cim + xim * cre;
+      i += 2;
+    );
+  );
+);
+
+function frame_finish() local(blk, wp) (
+  blk = (kblk - 1) % WB;
+  any_mac ? (
+    wp = blk * BS;
+    ifft_real(ACCL, FS); ifft_real(ACCR, FS);
+    memcpy(WETL + wp, ACCL + BS, BS); memcpy(WETR + wp, ACCR + BS, BS);
+    WSC[blk] = ir_gain / (4 * FS);
+  ) : ( WSC[blk] = 0; );
+);
+
+// Gain of the swell for onset record r at output time t_out: fade in over Length, a 3 ms
+// fade where the window starts, and the fade out that ends Overlap after the onset.
+function rec_gain(r) local(on_t, w0, sw_len, g, q, fi_n) (
+  on_t = REC_T[r]; w0 = REC_W[r];
+  t_out < w0 ? 0 : (
+    g = 1;
+    t_out < on_t ? (
+      sw_len = REC_L[r];
+      fi_n = fi_frac * sw_len;
+      (q = t_out - on_t + sw_len) < fi_n ? g = smooth01(q / fi_n);
+      (q = t_out - w0) < ac_n ? g *= smooth01(q / ac_n);
+    );
+    (q = on_t + ov_n - t_out) < fo_n ? g *= smooth01(q / fo_n);
+    g;
+  );
+);
+
+// Gain g of record r with the tremolo, whose dips are timed from the onset so it is at full
+// level there.
+function trem_gain(r, g) (
+  g > 0 && td > 0 ? g * (1 - td * (0.5 - 0.5 * cos(trem_w * (t_out - REC_T[r])))) : g;
+);
+
+// Pre-echoes at output time t_out into ecl, ecr: echo k is the input at t_out + k * dd, at
+// Delay feedback ^ (k - 1), up to the lookahead the ring holds and down to -80 dB, times nm.
+// Ping-pong (pp) sends the mono sum of odd echoes left and of even echoes right.
+function echo_sum(dd, nm, pp) local(k, off, g, i) (
+  ecl = ecr = 0; g = 1; k = 1;
+  off = floor(dd + 0.5);
+  pp ? (
+    while (off <= DLY && g > 0.0001) (
+      i = dr + off; i >= DRN ? i -= DRN;
+      ecl += (DRYL[i] + DRYR[i]) * g;
+      g *= e_fb; k += 1; off = floor(k * dd + 0.5);
+      off <= DLY && g > 0.0001 ? (
+        i = dr + off; i >= DRN ? i -= DRN;
+        ecr += (DRYL[i] + DRYR[i]) * g;
+        g *= e_fb; k += 1; off = floor(k * dd + 0.5);
+      );
+    );
+  ) : (
+    while (off <= DLY && g > 0.0001) (
+      i = dr + off; i >= DRN ? i -= DRN;
+      ecl += DRYL[i] * g; ecr += DRYR[i] * g;
+      g *= e_fb; k += 1; off = floor(k * dd + 0.5);
+    );
+  );
+  ecl *= nm; ecr *= nm;
+);
+
+// 1 / sqrt(sum of the squared echo gains): more feedback spreads the same energy over more
+// echoes, so a held sound, where every echo overlaps, keeps its level. Ping-pong's mono sum
+// (L + R) and single channel per echo take sqrt(0.5) for the same total energy.
+function echo_norm(dd, pp) local(k, off, g, s) (
+  s = 0; g = 1; k = 1;
+  off = floor(dd + 0.5);
+  while (off <= DLY && g > 0.0001) (
+    s += g * g; g *= e_fb; k += 1;
+    off = floor(k * dd + 0.5);
+  );
+  s > 0 ? (pp ? sqrt(0.5) : 1) / sqrt(s) : 0;
+);
+
+// 24 dB/oct low-pass: two Butterworth state-variable stages with coefficients sa*, sb*.
+function lp4(x) instance(s0, s1, s2, s3) local(v1, v2, v3) (
+  v3 = x - s1; v1 = sa1 * s0 + sa2 * v3; v2 = s1 + sa2 * s0 + sa3 * v3;
+  s0 = 2 * v1 - s0; s1 = 2 * v2 - s1;
+  v3 = v2 - s3; v1 = sb1 * s2 + sb2 * v3; v2 = s3 + sb2 * s2 + sb3 * v3;
+  s2 = 2 * v1 - s2; s3 = 2 * v2 - s3;
+  v2;
+);
+
+function lp4_reset() instance(s0, s1, s2, s3) ( s0 = s1 = s2 = s3 = 0; );
+
+// One step of the current block's work, spread over the block so no audio callback does it all.
+function conv_step() (
+  st == 0 ? (
+    kblk > 0 ? frame_start() : ( next_step = -1; );
+  ) : st <= j_eff ? (
+    mac(st - 1);
+    st += 1;
+    next_step = st <= j_eff ? next_step + stride : BS - 1;
+  ) : (
+    frame_finish();
+    next_step = -1;
+  );
+);
+
+// ---------------- setup ----------------
+
+!ready || srate != cur_sr ? ( rate_init(); ready = 1; );
+update_params();                         // after rate_init: fades are in samples
+ir_changed() ? ir_build_start();
+building || swap_pending ? ir_build_now();
+ls_n = swell_samples();
+set_latency(target_dly());
+update_tempo_fx();
+d_a = d_b; pp_a = pp_b; xf_left = 0;     // @init also runs on play start: no crossfade
+en_a = en_b = echo_norm(d_a, pp_a);
+dg = dry_t; wg = wet_t; rv = rv_t; el = el_t; td = td_t;
+sw_on = sw_amt > 0; sw_run = sw_c = 0;
+first_block = 1;
+
+@serialize
+file_var(0, saved_tempo);
+file_var(0, saved_tsn);
+file_var(0, saved_tsd);
+
+@slider
+update_params();
+update_tempo_fx();
+ir_changed() ? ir_build_start();
+!(play_state & 1) ? ( ls_n = swell_samples(); dn = target_dly(); dn != DLY ? set_latency(dn); );
+
+@block
+tempo > 0 ? (
+  saved_tempo = tempo;
+  ts_num > 0 && ts_denom > 0 ? ( saved_tsn = ts_num; saved_tsd = ts_denom; );
+);
+ls_n = swell_samples();
+update_tempo_fx();
+// REAPER takes a new latency only while stopped or before the first block plays
+first_block || !(play_state & 1) ? ( dn = target_dly(); dn != DLY ? set_latency(dn); );
+first_block = 0;
+building ? ( b_phase == 0 ? ir_build_gen(8192) : ir_build_fft(2); );
+abs(dg - dry_t) < 0.00001 ? dg = dry_t;
+abs(wg - wet_t) < 0.000001 ? wg = wet_t;
+abs(rv - rv_t) < 0.000001 ? rv = rv_t;
+abs(el - el_t) < 0.000001 ? el = el_t;
+abs(td - td_t) < 0.000001 ? td = td_t;
+d_a != nd_a || d_b != nd_b || pp_a != npp_a || pp_b != npp_b || e_fb != n_fb || DLY != n_dly ? (
+  en_a = echo_norm(d_a, pp_a); en_b = echo_norm(d_b, pp_b);
+  nd_a = d_a; nd_b = d_b; npp_a = pp_a; npp_b = pp_b; n_fb = e_fb; n_dly = DLY;
+);
+
+@sample
+in_l = spl0; in_r = spl1;
+INR[ip] = 0.5 * (in_l + in_r);
+DRYL[dw] = in_l; DRYR[dw] = in_r;
+
+// onsets: sound after at least hold_n samples of silence
+abs(in_l) > thr || abs(in_r) > thr ? (
+  silent ? (
+    pos_n - run_start >= hold_n ? push_onset();
+    silent = 0;
+  );
+) : !silent ? ( silent = 1; run_start = pos_n; );
+
+ph == next_step ? conv_step();
+
+dg += (dry_t - dg) * sm_k;
+wg += (wet_t - wg) * sm_k;
+rv += (rv_t - rv) * sm_k;
+el += (el_t - el) * sm_k;
+td += (td_t - td) * sm_k;
+
+// output for time t_out = pos_n - DLY. Past its onset a record only fades out, and the latest
+// onset fades out last, so drop older ones; its overlap can run into the next swell, so take
+// the louder of the two: gp before the tremolo, from record ra, and gate with it.
+t_out = pos_n - DLY;
+while (rtail != rhead && (REC_T[rtail] + ov_n <= t_out ||
+       ((r_next = (rtail + 1) & RMASK) != rhead && REC_T[r_next] <= t_out))) (
+  rtail = (rtail + 1) & RMASK;
+);
+gp = gate = 0;
+rtail != rhead ? (
+  ra = rtail;
+  gp = rec_gain(rtail);
+  gate = trem_gain(rtail, gp);
+  (r_next = (rtail + 1) & RMASK) != rhead ? (
+    g2 = rec_gain(r_next);
+    gate = max(gate, trem_gain(r_next, g2));
+    g2 > gp ? ( gp = g2; ra = r_next; );
+  );
+);
+
+dr = dw + 1; dr >= DRN ? dr = 0;
+gp > 0 ? (
+  w_sc = rv * WSC[(wrp / BS) | 0];
+  out_l = WETL[wrp] * w_sc;
+  out_r = WETR[wrp] * w_sc;
+  el > 0 ? (
+    echo_sum(d_a, en_a, pp_a);
+    xf_left > 0 ? (
+      xa = xf_left / xf_n; e1l = ecl; e1r = ecr;
+      echo_sum(d_b, en_b, pp_b);
+      ecl = e1l * xa + ecl * (1 - xa); ecr = e1r * xa + ecr * (1 - xa);
+    );
+    out_l += ecl * el; out_r += ecr * el;
+  );
+  // the sweep follows ra's swell, opening in octaves at an even rate, fully open from its
+  // onset; its cutoff is updated every 16 samples. It is switched on or off only between
+  // swells, and starts from rest.
+  sw_on ? (
+    sw_c <= 0 ? (
+      sw_p = t_out < REC_T[ra] ? (t_out - REC_T[ra] + REC_L[ra]) / REC_L[ra] : 1;
+      lf_t = lf_end - (1 - sw_p) * sw_amt * ln500;
+      sw_run ? lf_s += (lf_t - lf_s) * sw_k : ( lf_s = lf_t; swl.lp4_reset(); swr.lp4_reset(); sw_run = 1; );
+      gq = tan(pi_sr * exp(lf_s));
+      sa1 = 1 / (1 + gq * (gq + bk1)); sa2 = gq * sa1; sa3 = gq * sa2;
+      sb1 = 1 / (1 + gq * (gq + bk2)); sb2 = gq * sb1; sb3 = gq * sb2;
+      sw_c = 16;
+    );
+    sw_c -= 1;
+    out_l = swl.lp4(out_l); out_r = swr.lp4(out_r);
+  );
+  w_sc = gate * wg;
+  spl0 = DRYL[dr] * dg + out_l * w_sc;
+  spl1 = DRYR[dr] * dg + out_r * w_sc;
+) : (
+  sw_run = sw_c = 0; sw_on = sw_amt > 0;
+  spl0 = DRYL[dr] * dg;
+  spl1 = DRYR[dr] * dg;
+);
+xf_left > 0 ? ( (xf_left -= 1) <= 0 ? ( d_a = d_b; pp_a = pp_b; en_a = en_b; xf_left = 0; ); );
+
+pos_n += 1;
+(ip += 1) >= 4 * BS ? ip = 0;
+(dw += 1) >= DRN ? dw = 0;
+(wrp += 1) >= WRN ? wrp = 0;
+(ph += 1) >= BS ? ( ph = 0; kblk += 1; st = 0; next_step = 0; );
