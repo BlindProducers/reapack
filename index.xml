@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Blind Producers" commit="539afdc4e7f6c5e686c17bb6c53316984aa46894">
+<index version="1" name="Blind Producers" commit="f7403035ada12e387de55f6515aa695e8afef7bf">
   <category name="Dynamics">
     <reapack name="BP Carve.jsfx" type="effect" desc="BP Carve">
       <metadata>
@@ -16,6 +16,28 @@
       <version name="1.0" author="Blind Producers" time="2026-11-25T23:35:32Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source>https://github.com/BlindProducers/reapack/raw/26c120b4e39879c1d56f03a8db045db9f742f1eb/Dynamics/BP%20Carve.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Experimental">
+    <reapack name="BP Reverse Reverb.jsfx" type="effect" desc="BP Reverse Reverb">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Plays a reverse reverb swell before every item on its track. The swell rises into the item's first sound and fades out just after it, in sync with the project.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Select the track that holds the items and run Track: Prevent track media buffering. Without it, swells in the first seconds after you press Play stay silent.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab At 100 % Dry/wet, the default, only the swells play: put it on a copy of the items' track or on a send.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Each item needs at least 5 ms of silence before it.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Pre-echoes, a tempo-synced tremolo and a filter sweep can build into each item.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab The latency is as long as the swell, up to 5.3 s at 48 kHz, so don't monitor live input through it.\sa180\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.3" author="Blind Producers" time="2026-11-26T15:25:37Z">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source>https://github.com/BlindProducers/reapack/raw/f7403035ada12e387de55f6515aa695e8afef7bf/Experimental/BP%20Reverse%20Reverb.jsfx</source>
       </version>
     </reapack>
   </category>
@@ -57,6 +79,24 @@
       <version name="1.1" author="Blind Producers" time="2026-11-26T12:35:17Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source>https://github.com/BlindProducers/reapack/raw/539afdc4e7f6c5e686c17bb6c53316984aa46894/Pitch/BP%20Live%20Tune.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Space">
+    <reapack name="BP Glacier.jsfx" type="effect" desc="BP Glacier">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 A lush, modulated reverb that goes from a tight room to endless soundscapes, with Freeze to hold the tail.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab The granular section, off by default, plays grains from the reverb tail or the input: pitched, reversed and scattered across the stereo field, and fed back into the reverb if you want clouds that build on themselves.\sa180\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.0" author="Blind Producers" time="2026-11-26T15:25:37Z">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source>https://github.com/BlindProducers/reapack/raw/3b340300dcb3876cb97aa292b02840d2ad8f4307/Space/BP%20Glacier.jsfx</source>
       </version>
     </reapack>
   </category>
