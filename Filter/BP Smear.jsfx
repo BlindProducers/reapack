@@ -1,0 +1,447 @@
+desc:BP Smear
+author: Blind Producers
+version: 1.0
+tags: disperser allpass spectral delay phase chirp laser
+changelog:
+  Initial release
+about:
+  Delays each frequency by its own amount, so a click comes out as a chirp: laser-like allpass smears, sweeps, rising or falling echoes and scattered textures.
+  - Classic: a chain of allpass filters with no latency. Disperse stages sets the length of the chirp, Disperse frequency where it centres, and Disperse Q how narrow it rings.
+  - Spectral: adds a delay for each octave band, Scatter, Stereo spread, note tuning with harmonics, and Feedback with Shift per echo. Its latency of one FFT is compensated by REAPER.
+
+slider1:mode=0<0,1,1{Spectral,Classic}>Mode
+slider2:scale=100<0,200,0.1>Delay scale (%)
+slider3:stages=50<0,500,1>Disperse stages
+slider4:tuning=0<0,1,1{Frequency,Note}>Disperse tuning
+slider5:dfreq=400<20,20000,1:log>Disperse frequency (Hz)
+slider6:dnote=21<0,83,1{C1,C#1,D1,D#1,E1,F1,F#1,G1,G#1,A1,A#1,B1,C2,C#2,D2,D#2,E2,F2,F#2,G2,G#2,A2,A#2,B2,C3,C#3,D3,D#3,E3,F3,F#3,G3,G#3,A3,A#3,B3,C4,C#4,D4,D#4,E4,F4,F#4,G4,G#4,A4,A#4,B4,C5,C#5,D5,D#5,E5,F5,F#5,G5,G#5,A5,A#5,B5,C6,C#6,D6,D#6,E6,F6,F#6,G6,G#6,A6,A#6,B6,C7,C#7,D7,D#7,E7,F7,F#7,G7,G#7,A7,A#7,B7}>Disperse note
+slider7:harm=1<1,16,1>Disperse harmonics
+slider8:dq=1.4<0.25,32,0.01:log>Disperse Q
+slider9:dtime=100<1,2000,1:log>Delay time (ms)
+slider10:dsync=0<0,14,1{Off,1/64,1/32,1/16 triplet,1/16,1/16 dotted,1/8 triplet,1/8,1/8 dotted,1/4 triplet,1/4,1/4 dotted,1/2,1 bar,2 bars}>Delay sync
+slider11:b0=0<0,100,0.1>31 Hz delay (%)
+slider12:b1=0<0,100,0.1>63 Hz delay (%)
+slider13:b2=0<0,100,0.1>125 Hz delay (%)
+slider14:b3=0<0,100,0.1>250 Hz delay (%)
+slider15:b4=0<0,100,0.1>500 Hz delay (%)
+slider16:b5=0<0,100,0.1>1 kHz delay (%)
+slider17:b6=0<0,100,0.1>2 kHz delay (%)
+slider18:b7=0<0,100,0.1>4 kHz delay (%)
+slider19:b8=0<0,100,0.1>8 kHz delay (%)
+slider20:b9=0<0,100,0.1>16 kHz delay (%)
+slider21:scatter=0<0,100,0.1>Scatter (%)
+slider22:pattern=1<1,100,1>Scatter pattern
+slider23:spread=0<-100,100,0.1>Stereo spread (%)
+slider24:fbk=0<0,95,0.1>Feedback (%)
+slider25:tilt=0<-100,100,0.1>Feedback tilt (%)
+slider26:shift=0<-1000,1000,1>Shift per echo (Hz)
+slider27:res=1<0,2,1{Low,Medium,High}>Resolution
+slider28:mix=100<0,100,0.1>Mix (%)
+slider29:out_db=0<-24,24,0.1>Output (dB)
+
+options:maxmem=16777216
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// Two modes. Classic is a cascade of identical 2nd-order allpass filters (the standard bilinear
+// allpass at the Disperse frequency and Q), up to 64 stages, with no latency. Changes to the stage
+// count crossfade over 20 ms; frequency and Q glide (20 ms time constant).
+//
+// Spectral. A short-time FFT (Hann windows, 8x overlap) splits each channel into bins. Every
+// bin gets its own delay tau (in samples) and lag phase Phi, which together act like an allpass
+// filter with group delay tau: Phi is the integral of tau over frequency, so a click comes out as
+// a chirp. tau is the sum of
+//  - the Disperse curve: the exact group delay and phase of a cascade of identical 2nd-order
+//    allpass sections at the Disperse frequency (and its harmonics), times the stage count;
+//  - the band curve: the 10 band sliders, joined by cosine steps over log frequency, as a
+//    percentage of Delay time, plus Scatter (a random value per bin, same in both channels);
+// all times Delay scale, and Stereo spread (left x (1 - spread/2), right x (1 + spread/2)).
+// A bin is delayed by D = round(tau / hop) whole frames from a ring of past spectra, and its
+// phase is turned by Phi - (bin frequency) * D * hop, so the total phase stays Phi.
+// Feedback re-enters the ring with its own delay max(tau, hop), optionally moved by a whole
+// number of bins per echo (Shift per echo); a phase step per frame keeps moved bins coherent.
+// Spectral mode reports one FFT of latency, which REAPER compensates. With no delay the output
+// equals the input. analysis/model.py is the reference model; analysis/test_render.py checks
+// the plugin against it.
+
+ext_tail_size = -1;
+maxd = 4;                          // longest delay of any bin (s)
+bs = 16400;                        // per-bin table stride (up to 16385 bins)
+buf_a = 0; buf_b = 32768;          // FFT buffers, both inside the first 65536-slot block
+in_a = 65536; in_b = in_a + 32768; out_a = in_b + 32768; out_b = out_a + 32768;
+win_t = out_b + 32768; ola_t = win_t + 32768; fbuf = ola_t + 32768;
+c1_t = fbuf + 32768; s1_t = c1_t + bs; c2_t = s1_t + bs; s2_t = c2_t + bs;
+bi_t = s2_t + bs; bw_t = bi_t + bs; lx_t = bw_t + bs;
+ptau_t = lx_t + bs; pphi_t = ptau_t + bs; btau_t = pphi_t + bs; bphi_t = btau_t + bs;
+g_t = bphi_t + bs;
+d0_t = g_t + bs; e0_t = d0_t + bs; rc0_t = e0_t + bs; rs0_t = rc0_t + bs; ec0_t = rs0_t + bs; es0_t = ec0_t + bs;
+d1_t = es0_t + bs; e1_t = d1_t + bs; rc1_t = e1_t + bs; rs1_t = rc1_t + bs; ec1_t = rs1_t + bs; es1_t = ec1_t + bs;
+bnd = es1_t + bs; sync_qn = bnd + 16;
+cl_max = 64;                       // most stages in Classic mode
+cla1 = sync_qn + 16; cla2 = cla1 + 72; clb1 = cla2 + 72; clb2 = clb1 + 72;  // Classic filter states
+rings = clb2 + 72;
+cache = 16777216 - 64;             // last slider values seen by @slider (outside what setup() clears)
+
+lcg_m = 2147483647;
+cur_n = 0;  // forces setup() (memory is cleared before @init)
+
+// 1 if any of sliders first..last changed since the last call.
+function changed(first, last) local(i, c, v)
+(
+  c = 0; i = first;
+  loop(last - first + 1,
+    v = slider(i);
+    v != cache[i] ? (c = 1; cache[i] = v);
+    i += 1;
+  );
+  c;
+);
+
+// Tables that depend on the sample rate and FFT size; clears all audio state.
+function setup() local(mm, k, w, f, x, i)
+(
+  mm = 1;
+  loop(2, srate / mm > 64000 ? (mm *= 2););
+  fftn = (res == 0 ? 2048 : (res == 1 ? 4096 : 8192)) * mm;
+  hop = fftn / 8; nbins = fftn / 2 + 1;
+  nfr = ceil(maxd * srate / hop) + 1;
+  ring0 = rings; ring1 = ring0 + nfr * fftn;
+  memset(0, 0, ring1 + nfr * fftn);
+  // Delay sync choices in quarter notes (negative: bars)
+  sync_qn[0] = 0; sync_qn[1] = 1 / 16; sync_qn[2] = 1 / 8; sync_qn[3] = 1 / 6; sync_qn[4] = 1 / 4;
+  sync_qn[5] = 3 / 8; sync_qn[6] = 1 / 3; sync_qn[7] = 1 / 2; sync_qn[8] = 3 / 4; sync_qn[9] = 2 / 3;
+  sync_qn[10] = 1; sync_qn[11] = 3 / 2; sync_qn[12] = 2; sync_qn[13] = -1; sync_qn[14] = -2;
+  k = 0;
+  loop(fftn,
+    win_t[k] = 0.5 - 0.5 * cos(2 * $pi * k / fftn);
+    ola_t[k] = win_t[k] / (6 * fftn);  // 1/3 for the overlapping squared windows, 1/(2N) for fft_real/ifft_real
+    k += 1;
+  );
+  k = 0;
+  loop(nbins,
+    w = 2 * $pi * k / fftn;
+    c1_t[k] = cos(w); s1_t[k] = sin(w); c2_t[k] = cos(2 * w); s2_t[k] = sin(2 * w);
+    f = max(k * srate / fftn, 0.000000001);
+    x = max(0, min(9, log(f / 31.25) / log(2)));
+    i = min(floor(x), 8);
+    bi_t[k] = i;
+    bw_t[k] = (1 - cos($pi * (x - i))) * 0.5;
+    lx_t[k] = max(0, min(1, log(max(f, 20) / 20) / log(1000)));
+    k += 1;
+  );
+  pos = 0; hop_cnt = 0; wslot = 0; fcount = 0;
+  cur_n = fftn; cur_sr = srate; cur_res = res; cur_mode = mode;
+  cl_snap = 1;
+  pinch_dirty = band_dirty = comb_dirty = 1;
+  mix_s = mix / 100; gain_s = 10 ^ (out_db / 20);
+  a_sm = 1 - exp(-1 / (0.02 * srate));
+  pdc_delay = mode == 1 ? 0 : fftn; pdc_bot_ch = 0; pdc_top_ch = 2;
+);
+
+// Disperse curve per stage: sum over harmonics of one allpass section's lag phase and group delay.
+function pinch_update() local(f0, q, h, fh, w0, al, d1, d2, k, c1, s1, c2, s2, re, im, nre, nim, on)
+(
+  memset(ptau_t, 0, nbins); memset(pphi_t, 0, nbins);
+  f0 = tuning == 0 ? dfreq : 440 * 2 ^ ((dnote + 24 - 69) / 12);
+  q = dq;
+  on = 1; h = 1;
+  loop(harm,
+    fh = h * f0;
+    (fh > 20000 || fh >= 0.49 * srate) ? (on = 0);
+    on ? (
+      w0 = 2 * $pi * fh / srate;
+      al = sin(w0) / (2 * q);
+      d1 = -2 * cos(w0) / (1 + al);
+      d2 = (1 - al) / (1 + al);
+      k = 0;
+      loop(nbins,
+        c1 = c1_t[k]; s1 = s1_t[k]; c2 = c2_t[k]; s2 = s2_t[k];
+        re = 1 + d1 * c1 + d2 * c2;
+        im = -d1 * s1 - d2 * s2;
+        nre = d1 * c1 + 2 * d2 * c2;
+        nim = -d1 * s1 - 2 * d2 * s2;
+        pphi_t[k] += 2 * (2 * $pi * k / fftn) + 2 * atan2(im, re);
+        ptau_t[k] += 2 - 2 * (nre * re + nim * im) / (re * re + im * im);
+        k += 1;
+      );
+    );
+    h += 1;
+  );
+  pinch_dirty = 0; comb_dirty = 1;
+);
+
+// Band curve plus Scatter (samples) and its running phase integral.
+function band_update() local(q, tt, k, i, v, sc, st, prev, acc, dw)
+(
+  bnd[0] = b0; bnd[1] = b1; bnd[2] = b2; bnd[3] = b3; bnd[4] = b4;
+  bnd[5] = b5; bnd[6] = b6; bnd[7] = b7; bnd[8] = b8; bnd[9] = b9;
+  dsync == 0 ? (
+    tt = dtime / 1000;
+  ) : (
+    q = sync_qn[dsync];
+    q < 0 ? (q = -q * (ts_denom > 0 ? ts_num * 4 / ts_denom : 4));
+    tt = q * 60 / (tempo > 0 ? tempo : 120);
+  );
+  tt *= srate;
+  sc = tt * scatter / 100;
+  st = pattern * 7919 + 12345;
+  dw = 2 * $pi / fftn;
+  acc = 0;
+  k = 0;
+  loop(nbins,
+    i = bi_t[k];
+    v = tt * (bnd[i] + (bnd[i + 1] - bnd[i]) * bw_t[k]) / 100;
+    sc > 0 ? (
+      st *= 16807; st -= floor(st / lcg_m) * lcg_m;
+      v += sc * (st / lcg_m);
+    );
+    k > 0 ? (acc += (v + prev) * 0.5 * dw);
+    btau_t[k] = v; bphi_t[k] = acc;
+    prev = v;
+    k += 1;
+  );
+  cur_tempo = tempo; cur_tsn = ts_num; cur_tsd = ts_denom;
+  band_dirty = 0; comb_dirty = 1;
+);
+
+// Per channel: frame delays, phase turns and feedback delays; feedback gains and shift.
+function chan_update(m, dt, et, rc, rs, ec, es) local(k, t, ph, te, df, pdf, acc, dd, ee, r, re, dw, nyq)
+(
+  dw = 2 * $pi / fftn;
+  nyq = nbins - 1;
+  acc = 0;
+  k = 0;
+  loop(nbins,
+    t = (stages * ptau_t[k] + btau_t[k]) * m;
+    ph = (stages * pphi_t[k] + bphi_t[k]) * m;
+    te = max(t, hop);
+    df = te - t;
+    k > 0 ? (acc += (df + pdf) * 0.5 * dw);
+    pdf = df;
+    dd = min(floor(t / hop + 0.5), nfr - 1);
+    ee = min(floor(te / hop + 0.5), nfr - 1);
+    dt[k] = dd; et[k] = ee;
+    r = ph - 2 * $pi * ((k * dd) % 8) / 8;
+    re = ph + acc - 2 * $pi * ((k * ee) % 8) / 8;
+    rc[k] = cos(r); ec[k] = cos(re);
+    (k == 0 || k == nyq) ? (rs[k] = es[k] = 0) : (rs[k] = sin(r); es[k] = sin(re));
+    k += 1;
+  );
+);
+
+function combine() local(k, tl, g)
+(
+  chan_update(scale / 100 * (1 - spread / 200), d0_t, e0_t, rc0_t, rs0_t, ec0_t, es0_t);
+  chan_update(scale / 100 * (1 + spread / 200), d1_t, e1_t, rc1_t, rs1_t, ec1_t, es1_t);
+  tl = tilt / 100; g = fbk / 100;
+  k = 0;
+  loop(nbins,
+    g_t[k] = g * (tl >= 0 ? 1 - tl * (1 - lx_t[k]) : 1 + tl * lx_t[k]);
+    k += 1;
+  );
+  sbin = floor(shift * fftn / srate + 0.5);
+  comb_dirty = 0;
+);
+
+// One channel's frame: buf holds its spectrum X on entry and the delayed spectrum Y on exit.
+function chan_frame(buf, ring, dt, et, rc, rs, ec, es) local(k, j, sl, a, re, im, c, s, g, lo, hi, i2, cs, sn, nyq)
+(
+  nyq = nbins - 1;
+  fbk > 0 ? (
+    // echoes: F = (ring delayed by E) turned by the feedback phase
+    k = 1; j = 2;
+    loop(nbins - 2,
+      sl = wslot - et[k]; sl < 0 ? (sl += nfr);
+      a = ring + sl * fftn + j;
+      re = a[0]; im = a[1]; c = ec[k]; s = es[k];
+      fbuf[j] = re * c + im * s; fbuf[j + 1] = im * c - re * s;
+      k += 1; j += 2;
+    );
+    sbin == 0 ? (
+      sl = wslot - et[0]; sl < 0 ? (sl += nfr);
+      buf[0] += g_t[0] * ring[sl * fftn] * ec[0];
+      sl = wslot - et[nyq]; sl < 0 ? (sl += nfr);
+      buf[1] += g_t[nyq] * ring[sl * fftn + 1] * ec[nyq];
+      k = 1; j = 2;
+      loop(nbins - 2,
+        g = g_t[k];
+        buf[j] += g * fbuf[j]; buf[j + 1] += g * fbuf[j + 1];
+        k += 1; j += 2;
+      );
+    ) : (
+      // moved by sbin bins, with a phase step that keeps the moved bins coherent from frame to frame
+      cs = cos(2 * $pi * sbin * fcount / 8); sn = sin(2 * $pi * sbin * fcount / 8);
+      lo = max(1, 1 + sbin); hi = min(nyq, nyq + sbin);
+      k = lo; j = 2 * lo; i2 = 2 * (lo - sbin);
+      loop(hi - lo,
+        re = fbuf[i2]; im = fbuf[i2 + 1]; g = g_t[k];
+        buf[j] += g * (re * cs - im * sn); buf[j + 1] += g * (re * sn + im * cs);
+        k += 1; j += 2; i2 += 2;
+      );
+    );
+    k = 0;
+    loop(fftn,
+      abs(buf[k]) < 0.000000000000000000000000000001 ? (buf[k] = 0);
+      k += 1;
+    );
+  );
+  memcpy(ring + wslot * fftn, buf, fftn);
+  // output: Y = (ring delayed by D) turned by the bin's phase
+  sl = wslot - dt[0]; sl < 0 ? (sl += nfr);
+  buf[0] = ring[sl * fftn] * rc[0];
+  sl = wslot - dt[nyq]; sl < 0 ? (sl += nfr);
+  buf[1] = ring[sl * fftn + 1] * rc[nyq];
+  k = 1; j = 2;
+  loop(nbins - 2,
+    sl = wslot - dt[k]; sl < 0 ? (sl += nfr);
+    a = ring + sl * fftn + j;
+    re = a[0]; im = a[1]; c = rc[k]; s = rs[k];
+    buf[j] = re * c + im * s; buf[j + 1] = im * c - re * s;
+    k += 1; j += 2;
+  );
+);
+
+// Classic: coefficients of the allpass c2 + c1 z^-1 + z^-2 over 1 + c1 z^-1 + c2 z^-2.
+function classic_coefs(f, q) local(w0, al, a0)
+(
+  w0 = 2 * $pi * f / srate;
+  al = sin(w0) / (2 * q);
+  a0 = 1 + al;
+  cl_c1 = -2 * cos(w0) / a0;
+  cl_c2 = (1 - al) / a0;
+);
+
+// Classic: runs stages 1..nproc on spl0/spl1 and keeps the outputs after stages ta and tb.
+// Each stage's input history is the previous stage's output history, so one pair per node.
+function cascade(nproc, ta, tb) local(k, x0, x1, p01, p02, p11, p12, q01, q02, q11, q12, y0, y1, c1, c2)
+(
+  c1 = cl_c1; c2 = cl_c2;
+  x0 = spl0; x1 = spl1;
+  p01 = cla1[0]; p02 = cla2[0]; p11 = clb1[0]; p12 = clb2[0];
+  cla1[0] = x0; cla2[0] = p01; clb1[0] = x1; clb2[0] = p11;
+  ta0 = tb0 = x0; ta1 = tb1 = x1;
+  k = 1;
+  loop(nproc,
+    q01 = cla1[k]; q02 = cla2[k]; q11 = clb1[k]; q12 = clb2[k];
+    y0 = c2 * (x0 - q02) + c1 * (p01 - q01) + p02;
+    y1 = c2 * (x1 - q12) + c1 * (p11 - q11) + p12;
+    cla1[k] = y0; cla2[k] = q01; clb1[k] = y1; clb2[k] = q11;
+    x0 = y0; x1 = y1; p01 = q01; p02 = q02; p11 = q11; p12 = q12;
+    k == ta ? (ta0 = y0; ta1 = y1);
+    k == tb ? (tb0 = y0; tb1 = y1);
+    k += 1;
+  );
+);
+
+function run_frame() local(k, j, w)
+(
+  j = pos; k = 0;
+  loop(fftn,
+    w = win_t[k];
+    buf_a[k] = in_a[j] * w;
+    buf_b[k] = in_b[j] * w;
+    k += 1; j += 1; j >= fftn ? (j = 0);
+  );
+  fft_real(buf_a, fftn); fft_permute(buf_a, fftn / 2);
+  fft_real(buf_b, fftn); fft_permute(buf_b, fftn / 2);
+  chan_frame(buf_a, ring0, d0_t, e0_t, rc0_t, rs0_t, ec0_t, es0_t);
+  chan_frame(buf_b, ring1, d1_t, e1_t, rc1_t, rs1_t, ec1_t, es1_t);
+  wslot += 1; wslot >= nfr ? (wslot = 0);
+  fcount = (fcount + 1) % 8;
+  fft_ipermute(buf_a, fftn / 2); ifft_real(buf_a, fftn);
+  fft_ipermute(buf_b, fftn / 2); ifft_real(buf_b, fftn);
+  j = pos; k = 0;
+  loop(fftn,
+    w = ola_t[k];
+    out_a[j] += buf_a[k] * w;
+    out_b[j] += buf_b[k] * w;
+    k += 1; j += 1; j >= fftn ? (j = 0);
+  );
+);
+
+@slider
+// rebuild only what the changed sliders affect
+changed(4, 8) ? (pinch_dirty = 1);                    // Disperse tuning to Q
+changed(9, 22) ? (band_dirty = 1);                    // Delay time to Scatter pattern
+(changed(2, 3) || changed(23, 26)) ? (comb_dirty = 1); // scale, stages, spread, feedback, shift
+// bit n-1 is slider n
+slider_show(2 ^ 4, tuning == 0);
+slider_show(2 ^ 5, tuning == 1);
+slider_show(2 ^ 1 + 2 ^ 6 + 2 ^ 27 - 2 ^ 9, mode == 0);  // Spectral only: scale, harmonics, sync to Resolution
+slider_show(2 ^ 8, mode == 0 && dsync == 0);
+mix_t = mix / 100;
+gain_t = 10 ^ (out_db / 20);
+
+@block
+(cur_n == 0 || srate != cur_sr || res != cur_res || mode != cur_mode) ? setup();
+cur_mode == 1 ? (
+  // Classic: glide targets, stage count with a crossfade from the previous count
+  cl_lf_t = log(max(20, min(tuning == 0 ? dfreq : 440 * 2 ^ ((dnote + 24 - 69) / 12), min(20000, 0.49 * srate))));
+  cl_lq_t = log(dq);
+  nt = min(floor(stages + 0.5), cl_max);
+  cl_snap ? (
+    cl_lf = cl_lf_t; cl_lq = cl_lq_t;
+    classic_coefs(exp(cl_lf), exp(cl_lq));
+    cl_na = cl_nb = cl_hi = nt; cl_fd = 1;
+    cl_snap = 0;
+  );
+  nt != cl_nb ? (
+    cl_na = cl_fd < 0.5 ? cl_na : cl_nb;
+    cl_nb = nt; cl_fd = 0;
+  );
+  cl_np = cl_fd < 1 ? max(cl_na, cl_nb) : cl_nb;
+  cl_np > cl_hi ? (
+    // stages that were not running start from silence
+    memset(cla1 + cl_hi + 1, 0, cl_np - cl_hi); memset(cla2 + cl_hi + 1, 0, cl_np - cl_hi);
+    memset(clb1 + cl_hi + 1, 0, cl_np - cl_hi); memset(clb2 + cl_hi + 1, 0, cl_np - cl_hi);
+  );
+  cl_hi = cl_np;
+  cl_df = 1 / (0.02 * srate);
+) : (
+  (dsync > 0 && (tempo != cur_tempo || ts_num != cur_tsn || ts_denom != cur_tsd)) ? (band_dirty = 1);
+  pinch_dirty ? pinch_update();
+  band_dirty ? band_update();
+  comb_dirty ? combine();
+);
+
+@sample
+cur_mode == 1 ? (
+  (cl_lf != cl_lf_t || cl_lq != cl_lq_t) ? (
+    cl_lf += (cl_lf_t - cl_lf) * a_sm;
+    cl_lq += (cl_lq_t - cl_lq) * a_sm;
+    abs(cl_lf - cl_lf_t) < 0.0000001 ? (cl_lf = cl_lf_t);
+    abs(cl_lq - cl_lq_t) < 0.0000001 ? (cl_lq = cl_lq_t);
+    classic_coefs(exp(cl_lf), exp(cl_lq));
+  );
+  cascade(cl_np, cl_na, cl_nb);
+  cl_fd < 1 ? (
+    cl_fd = min(1, cl_fd + cl_df);
+    o0 = ta0 + (tb0 - ta0) * cl_fd; o1 = ta1 + (tb1 - ta1) * cl_fd;
+  ) : (
+    o0 = tb0; o1 = tb1;
+  );
+  mix_s += (mix_t - mix_s) * a_sm;
+  gain_s += (gain_t - gain_s) * a_sm;
+  spl0 = (o0 * mix_s + spl0 * (1 - mix_s)) * gain_s;
+  spl1 = (o1 * mix_s + spl1 * (1 - mix_s)) * gain_s;
+) : (
+  d0 = in_a[pos]; d1 = in_b[pos];
+  o0 = out_a[pos]; o1 = out_b[pos];
+  out_a[pos] = 0; out_b[pos] = 0;
+  in_a[pos] = spl0; in_b[pos] = spl1;
+  mix_s += (mix_t - mix_s) * a_sm;
+  gain_s += (gain_t - gain_s) * a_sm;
+  spl0 = (o0 * mix_s + d0 * (1 - mix_s)) * gain_s;
+  spl1 = (o1 * mix_s + d1 * (1 - mix_s)) * gain_s;
+  pos += 1;
+  pos >= fftn ? (pos = 0);
+  hop_cnt += 1;
+  hop_cnt >= hop ? (
+    hop_cnt = 0;
+    run_frame();
+  );
+);
