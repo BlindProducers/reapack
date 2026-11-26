@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Blind Producers" commit="0e89f6e23461228c65e5ecff7e683f31f27f124e">
+<index version="1" name="Blind Producers" commit="539afdc4e7f6c5e686c17bb6c53316984aa46894">
   <category name="Dynamics">
     <reapack name="BP Carve.jsfx" type="effect" desc="BP Carve">
       <metadata>
@@ -35,6 +35,28 @@
       <version name="1.0" author="Blind Producers" time="2026-11-26T00:10:42Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source>https://github.com/BlindProducers/reapack/raw/274ac5bac9f367a4338e1ca21ed46aee32c95321/Filter/BP%20Smear.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Pitch">
+    <reapack name="BP Live Tune.jsfx" type="effect" desc="BP Live Tune">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Real-time pitch correction for vocals and monophonic instruments.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Corrects to the nearest note of a key and scale, or to the notes held on its MIDI input. Each note can follow the scale, be added, removed or bypassed.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Retune speed sets how fast a note reaches its target, Humanize slows the correction of sustained notes, and Flex-tune corrects only notes sung close to their target.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Natural vibrato scales the singer's vibrato; Vibrato depth, rate and delay add one.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Formants are kept when shifting (Preserve formants) and can be shifted on their own.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Latency depends on Input type (6 to 25 ms at 48 kHz) and is compensated by REAPER.\sa180\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.1" author="Blind Producers" time="2026-11-26T12:35:17Z">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source>https://github.com/BlindProducers/reapack/raw/539afdc4e7f6c5e686c17bb6c53316984aa46894/Pitch/BP%20Live%20Tune.jsfx</source>
       </version>
     </reapack>
   </category>
