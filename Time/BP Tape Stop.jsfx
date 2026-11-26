@@ -1,0 +1,242 @@
+desc:BP Tape Stop
+author: Blind Producers
+version: 1.0
+changelog:
+  Initial release
+about:
+  Slows a track down like a stopping tape or turntable. Automate Playrate and the envelope is the stop curve. A long sinc interpolator keeps the highs clean as the pitch drops.
+  - Tape stop: ramp Playrate from 100 % down to 0 %, then jump back to 100 % where the music returns.
+  - Tape start: jump to 0 % and ramp up to 100 %.
+  - Resync at 100%: On crossfades back in time with the track when Playrate reaches 100 %. Off keeps the lag.
+
+slider1:rate_pc=100<0,100,0.01>Playrate (%)
+slider2:resync=1<0,1,1{Off,On}>Resync at 100%
+
+options:maxmem=16777216
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// How it works. The input goes into a ring buffer and a read head plays it back at the
+// playrate, so the head falls behind the input while the tape is slowed. The head reads
+// between samples with a 128-tap Kaiser-windowed sinc: a table of 1024 phases, interpolated
+// linearly between phases. Its images stay 95 dB or more down, so slowing down never folds the
+// highs back as the grainy, bitcrushed noise that linear interpolation gives. At 100 % the
+// input passes unchanged, delayed by the 64-sample latency that REAPER compensates.
+//
+// The playrate follows the envelope sample by sample. REAPER reports each envelope point and
+// the value at the end of every block (slider_next_chg); the plugin interpolates linearly
+// between them and smooths jumps over 1 ms. REAPER delays a JSFX's automation by its latency,
+// so the stop lines up with the envelope.
+//
+// While the tape is slowed, a low cut rising from 5 Hz at 100 % to 30 Hz at 0 % removes the
+// subsonic rumble and the DC a stopped tape would hold, and below 4 % the level fades to
+// silence. Back at 100 %, Resync crossfades to the live input. The louder the slowed sound,
+// the longer the crossfade (1 to 8 ms), so a downbeat after a full stop keeps its attack.
+//
+// Memory and variables persist across @init because @serialize exists, so the table (which
+// doesn't depend on the sample rate) is built once on load. @init only resets the stream.
+
+KN = 128;            // sinc taps
+KM = 64;             // half the taps, and the latency in samples
+KP = 1024;           // table phases
+KBETA = 10;          // Kaiser window shape
+FULL = 0.99995;      // a playrate that shows as 100.00 %
+LOW_FADE = 0.04;     // below this playrate the level fades out
+MAXLAG_S = 30;       // longest the head can fall behind, in seconds
+
+TAB = 0;                          // (KP + 1) rows of KN taps
+AUTO_O = TAB + (KP + 1) * KN;     // automation points in this block: offsets
+AUTO_V = AUTO_O + 4096;           // and playrates
+HS = AUTO_V + 4096;               // current head: lag, then 4 low cut states
+FS = HS + 8;                      // fading head, same layout
+WINT = FS + 8;                    // Kaiser window on a 1/KP grid, used to build TAB
+BUF_L = 262144;                   // input rings (BUF_R follows BUF_L, sized in setup_rate)
+MEM_END = 16777216;               // options:maxmem
+
+function bessel_i0(x) local(s, t, k) (
+  s = 1; t = 1; k = 1;
+  loop(40, t *= (0.5 * x / k) * (0.5 * x / k); s += t; k += 1;);
+  s;
+);
+
+function build_table() local(m, u, j, p, t, h, sum, row, ib) (
+  ib = 1 / bessel_i0(KBETA);
+  m = 0;
+  loop(KM * KP + 1,
+    u = m / (KM * KP);
+    WINT[m] = bessel_i0(KBETA * sqrt(max(0, 1 - u * u))) * ib;
+    m += 1;
+  );
+  // row p holds the taps for the sample positions j - 63 - p / KP, j = 0..127
+  p = 1;
+  loop(KP - 1,
+    row = TAB + p * KN;
+    sum = 0; j = 0;
+    loop(KN,
+      t = j - (KM - 1) - p / KP;
+      h = sin($pi * t) / ($pi * t) * WINT[abs((j - (KM - 1)) * KP - p)];
+      row[j] = h; sum += h; j += 1;
+    );
+    j = 0; loop(KN, row[j] /= sum; j += 1;);
+    p += 1;
+  );
+  // phases 0 and 1 are single taps, so a whole-sample position reads the input exactly
+  memset(TAB, 0, KN); TAB[KM - 1] = 1;
+  memset(TAB + KP * KN, 0, KN); TAB[KP * KN + KM] = 1;
+);
+
+function reset_stream() (
+  wi = 0;
+  // the first reads after a reset reach back up to 2 * KN samples before the write index
+  memset(BUF_L + BLEN - 2 * KN, 0, 3 * KN);
+  memset(BUF_R + BLEN - 2 * KN, 0, 3 * KN);
+  h_tape = 0; f_on = 0;
+  memset(HS, 0, 16);
+);
+
+function setup_rate() (
+  cur_sr = srate;
+  // ring length: MAXLAG_S, room for a crossfade, and at most what fits in the memory
+  BLEN = min(ceil((MAXLAG_S + 0.05) * srate) + 2 * KN, floor((MEM_END - BUF_L) / 2) - KN);
+  MAXLAG = BLEN - 2 * KN - ceil(0.05 * srate);
+  BUF_R = BUF_L + BLEN + KN;                       // each ring has KN guard samples
+  SM_A = 1 - exp(-1 / (0.001 * srate));            // 1 ms playrate smoothing
+  HP_A0 = 2 * $pi * 5 / srate;                     // low cut at 100 %
+  HP_A1 = 2 * $pi * 25 / srate;                    // added at 0 %
+  XF_MIN = 0.001 * srate;                          // crossfade length from a silent head
+  XF_ADD = 0.007 * srate;                          // added for a head at full level
+  LAG_EP = 0.01 * srate;                           // lag above which the crossfade keeps power
+  reset_stream();
+);
+
+function speed_gain(r) local(u) (
+  r >= LOW_FADE ? 1 : (u = r / LOW_FADE; u * u * (3 - 2 * u));
+);
+
+// Reads the head whose state starts at st (lag behind the dry position, then the low cut
+// states) into tl and tr. Called from @sample only.
+function tape_read(st) local(lag, li, lf, base, f, pf, p, ph, row, d0, d1, xl, xr, a) (
+  lag = st[0];
+  li = floor(lag); lf = lag - li;
+  lf > 0 ? (
+    base = wi - KM - li - KM; f = 1 - lf;
+  ) : (
+    base = wi - KM - li - (KM - 1); f = 0;
+  );
+  base < 0 ? base += BLEN;
+  pf = f * KP; p = floor(pf); ph = pf - p;
+  row = TAB + p * KN;
+  d0 = mem_multiply_sum(row, BUF_L + base, KN);
+  ph > 0 ? (
+    d1 = mem_multiply_sum(row + KN, BUF_L + base, KN); xl = d0 + ph * (d1 - d0);
+    d0 = mem_multiply_sum(row, BUF_R + base, KN);
+    d1 = mem_multiply_sum(row + KN, BUF_R + base, KN); xr = d0 + ph * (d1 - d0);
+  ) : (
+    xl = d0;
+    xr = mem_multiply_sum(row, BUF_R + base, KN);
+  );
+  // low cut: two one-pole stages, y = x - s, s += a * y; the first output is the input
+  a = HP_A0 + HP_A1 * (1 - rs);
+  xl -= st[1]; st[1] += a * xl; xl -= st[2]; st[2] += a * xl;
+  xr -= st[3]; st[3] += a * xr; xr -= st[4]; st[4] += a * xr;
+  tl = xl; tr = xr;
+);
+
+// The current head becomes the fading head, so the caller can restart the current one.
+function start_fade() (
+  memcpy(FS, HS, 5);
+  f_on = 1; xf_n = 0;
+  xf_len = floor(XF_MIN + XF_ADD * speed_gain(rs));
+  xf_k = min(1, FS[0] / LAG_EP);
+);
+
+// the middle row is all zeros until the table is built
+TAB[(KP / 2) * KN + KM - 1] == 0 ? build_table();
+setup_rate();
+pdc_delay = KM; pdc_bot_ch = 0; pdc_top_ch = 2;
+first_blk = 1;
+
+@block
+srate != cur_sr ? setup_rate();
+
+// automation points in this block, as playrates from 0 to 1
+np = 0;
+while (np < 4096 && (o = slider_next_chg(1, nv)) > 0) (
+  AUTO_O[np] = o; AUTO_V[np] = min(max(nv * 0.01, 0), 1); np += 1;
+);
+seg_v0 = min(max(rate_pc * 0.01, 0), 1); seg_o0 = 0; seg_k = 0; sidx = 0;
+np > 0 ? (
+  seg_o = AUTO_O[0]; seg_v = AUTO_V[0]; seg_d = (seg_v - seg_v0) / seg_o;
+) : (
+  seg_o = -1; seg_d = 0;
+);
+first_blk ? (rs = seg_v0; first_blk = 0;);
+
+@sample
+// playrate at this sample, linear between the reported points
+while (sidx == seg_o) (
+  seg_v0 = seg_v; seg_o0 = seg_o; seg_k += 1;
+  seg_k < np ? (
+    seg_o = AUTO_O[seg_k]; seg_v = AUTO_V[seg_k]; seg_d = (seg_v - seg_v0) / (seg_o - seg_o0);
+  ) : (
+    seg_o = -1; seg_d = 0;
+  );
+);
+rt = seg_v0 + seg_d * (sidx - seg_o0);
+sidx += 1;
+rs += SM_A * (rt - rs);
+rt <= 0 && rs < 0.00001 ? rs = 0;
+rt >= FULL && rs > 0.99999 ? rs = 1;
+
+BUF_L[wi] = spl0; BUF_R[wi] = spl1;
+wi < KN ? (BUF_L[BLEN + wi] = spl0; BUF_R[BLEN + wi] = spl1;);
+
+!h_tape ? (
+  rt < FULL ? (h_tape = 1; memset(HS, 0, 5););
+) : !f_on ? (
+  resync && rt >= FULL ? (
+    start_fade(); h_tape = 0;
+  ) : HS[0] > MAXLAG ? (
+    start_fade(); memset(HS, 0, 5);
+  );
+);
+
+h_tape ? (
+  rs > 0 ? (
+    tape_read(HS); g = speed_gain(rs); outl = tl * g; outr = tr * g;
+  ) : (
+    outl = outr = 0;
+  );
+  HS[0] += 1 - rs;
+) : (
+  di = wi - KM; di < 0 ? di += BLEN;
+  outl = BUF_L[di]; outr = BUF_R[di];
+);
+
+f_on ? (
+  // incoming: from equal gain at small lags to equal power at 10 ms or more
+  xt = (xf_n + 1) / (xf_len + 1);
+  gi = 0.5 - 0.5 * cos($pi * xt);
+  go = 1 - gi;
+  gi += xf_k * (sin(0.5 * $pi * xt) - gi);
+  go += xf_k * (cos(0.5 * $pi * xt) - go);
+  rs > 0 ? (
+    tape_read(FS); g = speed_gain(rs) * go;
+    outl = outl * gi + tl * g; outr = outr * gi + tr * g;
+  ) : (
+    outl *= gi; outr *= gi;
+  );
+  FS[0] += 1 - rs;
+  (xf_n += 1) >= xf_len ? f_on = 0;
+);
+
+spl0 = outl; spl1 = outr;
+(wi += 1) >= BLEN ? wi = 0;
+
+@serialize
+// nothing to store; the section keeps memory and variables across @init
+file_var(0, ser_none);
