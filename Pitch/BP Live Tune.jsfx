@@ -1,0 +1,646 @@
+desc:BP Live Tune
+author: Blind Producers
+version: 1.1
+tags: pitch correction tuner vocal formant vibrato midi
+changelog:
+  Initial release
+about:
+  Real-time pitch correction for vocals and monophonic instruments.
+  - Corrects to the nearest note of a key and scale, or to the notes held on its MIDI input. Each note can follow the scale, be added, removed or bypassed.
+  - Retune speed sets how fast a note reaches its target, Humanize slows the correction of sustained notes, and Flex-tune corrects only notes sung close to their target.
+  - Natural vibrato scales the singer's vibrato; Vibrato depth, rate and delay add one.
+  - Formants are kept when shifting (Preserve formants) and can be shifted on their own.
+  - Latency depends on Input type (6 to 25 ms at 48 kHz) and is compensated by REAPER.
+
+slider1:key=0<0,11,1{C,C#,D,D#,E,F,F#,G,G#,A,A#,B}>Key
+slider2:scale=0<0,14,1{Chromatic,Major,Minor,Harmonic minor,Melodic minor,Major pentatonic,Minor pentatonic,Blues,Dorian,Phrygian,Lydian,Mixolydian,Locrian,Whole tone,Diminished}>Scale
+slider3:retune=20<0,400,1>Retune speed (ms)
+slider4:humanize=0<0,100,1>Humanize (%)
+slider5:flex=0<0,100,1>Flex-tune (%)
+slider6:natvib=0<-12,12,0.1>Natural vibrato (dB)
+slider7:itype=1<0,4,1{Soprano,Alto/Tenor,Low male,Instrument,Bass instrument}>Input type
+slider8:preserve=1<0,1,1{Off,On}>Preserve formants
+slider9:fshift=0<-12,12,0.1>Formant shift (semitones)
+slider10:transpose=0<-24,24,1>Transpose (semitones)
+slider11:refpitch=440<415,466,0.1>Reference pitch (Hz)
+slider12:miditgt=0<0,2,1{Off,Notes in any octave,Exact notes}>MIDI target notes
+slider13:vdepth=0<0,100,1>Vibrato depth (cents)
+slider14:vrate=5.5<2,10,0.1>Vibrato rate (Hz)
+slider15:vdelay=250<0,1000,1>Vibrato delay (ms)
+slider16:note0=0<0,3,1{From scale,Add,Remove,Bypass}>Note C
+slider17:note1=0<0,3,1{From scale,Add,Remove,Bypass}>Note C#
+slider18:note2=0<0,3,1{From scale,Add,Remove,Bypass}>Note D
+slider19:note3=0<0,3,1{From scale,Add,Remove,Bypass}>Note D#
+slider20:note4=0<0,3,1{From scale,Add,Remove,Bypass}>Note E
+slider21:note5=0<0,3,1{From scale,Add,Remove,Bypass}>Note F
+slider22:note6=0<0,3,1{From scale,Add,Remove,Bypass}>Note F#
+slider23:note7=0<0,3,1{From scale,Add,Remove,Bypass}>Note G
+slider24:note8=0<0,3,1{From scale,Add,Remove,Bypass}>Note G#
+slider25:note9=0<0,3,1{From scale,Add,Remove,Bypass}>Note A
+slider26:note10=0<0,3,1{From scale,Add,Remove,Bypass}>Note A#
+slider27:note11=0<0,3,1{From scale,Add,Remove,Bypass}>Note B
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// How it works
+//
+// Detector. The mono input is low-passed at 3 kHz (6th-order Butterworth) and decimated to about
+// 12 kHz. Every ~2 ms a YIN difference function (cumulative-mean normalized) over the newest
+// 1.25 periods finds the period: the first dip below 0.15, an octave-up guard, and a continuity
+// rule that keeps the previous period when it is nearly as good. The period is refined at the full
+// rate with a parabola. A voiced passage starts when two frames in a row agree on the period and
+// ends after three unvoiced frames.
+//
+// Pitch marks. The first mark of a voiced passage sits on the larger waveform peak; every next
+// mark is one waveform period on, at the lag that best matches one period with the next. Marks
+// that keep the same point of the cycle are what keeps the output pitch steady.
+//
+// Synthesis (TD-PSOLA). Hann grains, two analysis periods long (up to three for short periods and
+// small shifts), are centred on the marks and laid out at the target period, so the formants stay.
+// A formant factor resamples each grain through a 32-tap windowed sinc. Unvoiced input is read
+// continuously at the same delay, at ratio 1. When the voicing changes or the grain length jumps,
+// the old grains fade out by their own windows and the new ones fade in by the rest, read at the
+// same delay, so nothing cancels.
+//
+// Correction (once per detector frame). Nearest allowed note with a little hysteresis, Flex-tune
+// deadzone, a one-pole retune whose half-time is Retune speed (reset at each new note), Humanize
+// slowing sustained notes, natural vibrato scaling around a 3 Hz centre, created vibrato and
+// transpose. At a change of target note the pitch jump of that reset glides out through two
+// one-poles of 2 ms, run per sample, so the output pitch stays continuous. The latency is 0.75 periods of the lowest pitch of the input type plus the
+// interpolator's half length; it is the lookahead the synthesis reads ahead with.
+
+NT = 32; NPH = 1024; NBAND = 5; IH = 17; LATK = 0.75;
+RF = 65536; RFM = 65535; RD = 4096; RDM = 4095;
+GN = 24; MKN = 32; MKM = 31; MQN = 1024; MQM = 1023;
+
+// memory
+TAB = 0;                        // NBAND x (NPH + 1) x NT kernel table
+RL = 196608; RR = RL + 2 * RF; RP = RR + 2 * RF;   // input rings (left, right, low-passed mono), written twice
+RDB = RP + 2 * RF;              // decimated ring, written twice
+DDB = RDB + 2 * RD; DNB = DDB + 512;                // YIN difference and normalized difference
+MKB = DNB + 512;                // marks
+GRS = MKB + 64; GRA = GRS + GN; GRF = GRA + GN; GRH = GRF + GN; GRHL = GRH + GN;
+GRG = GRHL + GN; GRC = GRG + GN; GROLD = GRC + GN; GRTB = GROLD + GN; GRON = GRTB + GN;
+HELD = GRON + GN; HELDPC = HELD + 128;              // held MIDI notes, per note and per pitch class
+MQ = HELDPC + 16;               // MIDI queue: time, note, on
+MDF = MQ + 3 * MQN;             // mark matching
+DF7 = MDF + 512;
+ALLOWB = DF7 + 16; BYPB = ALLOWB + 16; SMASK = BYPB + 16;
+TABOK = SMASK + 16;             // set once the kernel table is built; @serialize keeps memory across @init
+
+// scales as bit masks of semitones above the key
+SMASK[0] = 4095; SMASK[1] = 2741; SMASK[2] = 1453; SMASK[3] = 2477; SMASK[4] = 2733;
+SMASK[5] = 661; SMASK[6] = 1193; SMASK[7] = 1257; SMASK[8] = 1709; SMASK[9] = 1451;
+SMASK[10] = 2773; SMASK[11] = 1717; SMASK[12] = 1387; SMASK[13] = 1365; SMASK[14] = 2925;
+
+function bessel_i0(x) local(sum, term, y, k) (
+  sum = 1; term = 1; y = x * x / 4; k = 1;
+  loop(40, term *= y / (k * k); sum += term; k += 1;);
+  sum;
+);
+
+// tab[b][ph][k]: windowed sinc (Kaiser, beta 6) for fraction ph/NPH, cutoff 0.9 * 2^(-b/4) of
+// Nyquist, each row normalized to 1. Tap k reads sample floor(pos) - (NT/2 - 1) + k.
+function make_table() local(ph, k, b, xx, i0b, c, row, sum, h, fr) (
+  i0b = bessel_i0(6);
+  ph = 0;
+  loop(NPH + 1,
+    fr = ph / NPH;
+    k = 0;
+    loop(NT,
+      xx = k - (NT / 2 - 1) - fr;
+      MDF[k] = bessel_i0(6 * sqrt(max(0, 1 - (xx / (NT / 2)) * (xx / (NT / 2))))) / i0b;
+      k += 1;
+    );
+    b = 0;
+    loop(NBAND,
+      c = 0.9 * 2 ^ (-b / 4);
+      row = TAB + (b * (NPH + 1) + ph) * NT;
+      sum = 0; k = 0;
+      loop(NT,
+        xx = k - (NT / 2 - 1) - fr;
+        h = xx == 0 ? c : sin($pi * c * xx) / ($pi * xx);
+        row[k] = h * MDF[k]; sum += row[k];
+        k += 1;
+      );
+      k = 0; loop(NT, row[k] /= sum; k += 1;);
+      b += 1;
+    );
+    ph += 1;
+  );
+);
+
+// parameters of the next voiced grain, from the period and shift it is made with
+function update_vparams() local(u1, u2, u3, wk, bb) (
+  v_ratio = 2 ^ (sshift / 12);
+  v_f = min(max(fsh * (preserve > 0.5 ? 1 : v_ratio), 0.5), 2);
+  // longer grains keep more of the formant ringing of short periods, unless the pitch or the
+  // formants shift (their peaky spectrum would then be sampled between the harmonics)
+  u1 = min(max((0.004 * srate - sp_) / (0.0015 * srate), 0), 1);
+  u2 = min(max(1 - (abs(sshift) - 0.5), 0), 1);
+  u3 = min(max(1 - (abs(fshift) - 0.25) / 0.5, 0), 1);
+  wk = 1 + 0.5 * u1 * u2 * u3;
+  v_hin = wk * sp_; v_hout = v_hin / v_f; v_ps = sp_ / v_ratio;
+  v_gain = sqrt(v_f / v_ratio) / wk;    // overlap of wk: coherent; the rest of the density: power
+  // formant-shifted grains overlap less coherently: about 1.1 dB is lost once the shift passes 1.5
+  v_gain *= 1 + 0.13 * min(abs(fshift) / 1.5, 1);
+  v_c = v_ps / v_hout;
+  bb = v_f > 1 ? ceil(4 * log(v_f) / log(2) - 0.000000001) : 0;
+  v_tb = TAB + min(max(bb, 0), NBAND - 1) * (NPH + 1) * NT;
+);
+
+function update_uparams() local(bb) (
+  u_f = min(max(fsh, 0.5), 2);
+  u_hin = p_uv; u_hout = p_uv / u_f; u_ps = u_hout;
+  // resampled noise grains overlap incoherently (-1.25 dB for Hann at half overlap)
+  u_gain = 1 + 0.155 * min(abs(fshift) / 1.5, 1);
+  bb = u_f > 1 ? ceil(4 * log(u_f) / log(2) - 0.000000001) : 0;
+  u_tb = TAB + min(max(bb, 0), NBAND - 1) * (NPH + 1) * NT;
+);
+
+function reset_state() (
+  memset(RL, 0, 6 * RF + 2 * RD + 1024);
+  memset(MKB, 0, 64);
+  memset(GRS, 0, 10 * GN);
+  memset(HELD, 0, 128 + 16);
+  memset(MQ, 0, 3 * MQN);
+  ncount = 0; wd = 0; stereo_until = 0;
+  bz1 = bz2 = bz3 = bz4 = bz5 = bz6 = 0;
+  voiced = 0; was_voiced = 0; per = p_uv; taup = 0; uvc = 0; hold = 0; cand = 0;
+  nmk = 0; mk_last = 0; mk_valid = 0;
+  corr = 0; tgt = -1000; age = 0; vc1 = 0; vc2 = 0; vph = 0; shift = 0; gl1 = 0; gl2 = 0; pc_prev = 0;
+  s_next = -1000000000; delta = 0; nold = 0; rgm = 0; h_last = 1; sp_ = p_uv; sshift = 0;
+  nheld = 0; mq_w = 0; mq_r = 0;
+  update_vparams();
+);
+
+function setup_rate() local(kb, q, nrm) (
+  fmin = itype == 0 ? 130 : itype == 1 ? 80 : itype == 2 ? 55 : itype == 3 ? 50 : 30;
+  fmax = itype == 0 ? 1400 : itype == 1 ? 1000 : itype == 2 ? 600 : itype == 3 ? 2000 : 400;
+  dec = max(1, floor(srate / 12000 + 0.5)); fsd = srate / dec;
+  hopd = max(1, floor(0.002 * fsd + 0.5)); hop_s = hopd / fsd;
+  tmin = max(2, floor(fsd / fmax)); tmax = ceil(fsd / fmin) + 1;
+  lat = ceil(LATK * srate / fmin) + IH;
+  p_uv = floor(0.004 * srate + 0.5);
+  stspan = 2 * lat + 4 * ceil(srate / fmin) + 64;
+  a3 = 1 - exp(-2 * $pi * 3 * hop_s);
+  gdec = exp(-500 / srate);   // note-change glide: two one-poles of 2 ms
+  // 6th-order Butterworth low-pass at 3 kHz: 3 biquads, bilinear with prewarp
+  kb = tan($pi * 3000 / srate);
+  q = 1 / (2 * cos($pi / 12)); nrm = 1 / (1 + kb / q + kb * kb);
+  bq1b0 = kb * kb * nrm; bq1b1 = 2 * bq1b0; bq1b2 = bq1b0; bq1a1 = 2 * (kb * kb - 1) * nrm; bq1a2 = (1 - kb / q + kb * kb) * nrm;
+  q = 1 / (2 * cos(3 * $pi / 12)); nrm = 1 / (1 + kb / q + kb * kb);
+  bq2b0 = kb * kb * nrm; bq2b1 = 2 * bq2b0; bq2b2 = bq2b0; bq2a1 = 2 * (kb * kb - 1) * nrm; bq2a2 = (1 - kb / q + kb * kb) * nrm;
+  q = 1 / (2 * cos(5 * $pi / 12)); nrm = 1 / (1 + kb / q + kb * kb);
+  bq3b0 = kb * kb * nrm; bq3b1 = 2 * bq3b0; bq3b2 = bq3b0; bq3a1 = 2 * (kb * kb - 1) * nrm; bq3a2 = (1 - kb / q + kb * kb) * nrm;
+  pdc_delay = lat; pdc_bot_ch = 0; pdc_top_ch = 2;
+  cur_sr = srate; cur_it = itype;
+  update_uparams();
+  reset_state();
+);
+
+// The mark nearest to target, not after limit: one of the stored marks, or the mark grid
+// continued a period at a time past the newest mark or before the oldest one.
+function nearest_mark(target, limit) local(best, bd, m, q, mk, k, mo) (
+  best = limit; bd = 10 ^ 300; m = min(nmk, MKN);
+  q = 0;
+  loop(m,
+    mk = MKB[(nmk - 1 - q) & MKM];
+    (mk <= limit && abs(mk - target) < bd) ? (bd = abs(mk - target); best = mk;);
+    q += 1;
+  );
+  k = max(1, floor((target - mk_last) / sp_ + 0.5));
+  mk = mk_last + k * sp_;
+  mk > limit ? mk = mk_last + floor((limit - mk_last) / sp_) * sp_;
+  (mk > mk_last && abs(mk - target) < bd) ? (bd = abs(mk - target); best = mk;);
+  mo = MKB[(nmk - m) & MKM];
+  k = max(1, floor((mo - target) / sp_ + 0.5));
+  mk = mo - k * sp_;
+  (mk <= limit && abs(mk - target) < bd) ? (bd = abs(mk - target); best = mk;);
+  best;
+);
+
+// is note nn (any octave when miditgt is 1) a target?
+function note_ok(nn) local(pcn) (
+  pcn = nn - 12 * floor(nn / 12);
+  use_midi ? (
+    miditgt == 2 ? (nn >= 0 && nn < 128 && HELD[nn] > 0) : HELDPC[pcn] > 0;
+  ) : (
+    ALLOWB[pcn] == 1 && BYPB[pcn] == 0;
+  );
+);
+
+// @init runs on load, play start, seek and un-bypass: each starts from a clean state
+ext_tail_size = -1;     // REAPER may skip silent input once the output has settled
+fsh = 2 ^ (fshift / 12);
+TABOK[0] != 1 ? (make_table(); TABOK[0] = 1;);
+setup_rate();
+
+@slider
+gnv = 10 ^ (natvib / 20);
+fsh = 2 ^ (fshift / 12);
+smask_ = SMASK[scale];
+pc = 0;
+loop(12,
+  st = slider(16 + pc);
+  rel = (pc - key + 12) % 12;
+  insc = (smask_ >> rel) & 1;
+  ALLOWB[pc] = ((insc == 1 && st == 0) || st == 1 || st == 3) ? 1 : 0;
+  BYPB[pc] = st == 3 ? 1 : 0;
+  pc += 1;
+);
+itype != cur_it ? setup_rate() : (update_uparams(); update_vparams(););
+
+@serialize
+ser_version = 1;
+file_var(0, ser_version);
+
+@block
+srate != cur_sr ? setup_rate();
+while (midirecv(ofs, m1, m2, m3)) (
+  mst = m1 & 240;
+  (mst == 144 || mst == 128) && mq_w - mq_r < MQN ? (
+    qi = (mq_w & MQM) * 3;
+    MQ[qi] = ncount + ofs; MQ[qi + 1] = m2; MQ[qi + 2] = (mst == 144 && m3 > 0) ? 1 : 0;
+    mq_w += 1;
+  );
+  midisend(ofs, m1, m2, m3);
+);
+
+@sample
+// ---- MIDI
+while (mq_r < mq_w && MQ[(mq_r & MQM) * 3] <= ncount) (
+  qi = (mq_r & MQM) * 3; nn = MQ[qi + 1];
+  MQ[qi + 2] == 1 ? (
+    HELD[nn] += 1; HELDPC[nn % 12] += 1; nheld += 1;
+  ) : HELD[nn] > 0 ? (
+    HELD[nn] -= 1; HELDPC[nn % 12] -= 1; nheld -= 1;
+  );
+  mq_r += 1;
+);
+
+// ---- input
+in_l = spl0; in_r = spl1;
+wi = ncount & RFM;
+RL[wi] = in_l; RL[wi + RF] = in_l; RR[wi] = in_r; RR[wi + RF] = in_r;
+in_l != in_r ? stereo_until = ncount + stspan;
+v = 0.5 * (in_l + in_r);
+o = bq1b0 * v + bz1; bz1 = bq1b1 * v - bq1a1 * o + bz2; bz2 = bq1b2 * v - bq1a2 * o; v = o;
+o = bq2b0 * v + bz3; bz3 = bq2b1 * v - bq2a1 * o + bz4; bz4 = bq2b2 * v - bq2a2 * o; v = o;
+o = bq3b0 * v + bz5; bz5 = bq3b1 * v - bq3a1 * o + bz6; bz6 = bq3b2 * v - bq3a2 * o; v = o;
+RP[wi] = v; RP[wi + RF] = v;
+
+// ---- decimate and detect
+ncount % dec == dec - 1 ? (
+  wdi = wd & RDM;
+  RDB[wdi] = v; RDB[wdi + RD] = v;
+  wd += 1;
+  wd % hopd == 0 && wd > 2 * tmax + 2 ? (
+    voiced == 1 ? (
+      wy = min(max(ceil(1.25 * taup / dec), 2 * tmin), tmax);
+    ) : (
+      wy = max(2 * tmin, floor((tmax + 1) / 2));
+    );
+    // windows end at the newest sample: the current one is RDB[by .. by+wy-1], lag tau starts at by-tau
+    by = ((wd - wy - tmax) & RDM) + tmax;
+    e0 = mem_multiply_sum(RDB + by, RDB + by, wy);
+    et = e0; cum = 0; tau = 1;
+    loop(tmax,
+      x0 = RDB[by - tau]; x1 = RDB[by - tau + wy];
+      et = et + x0 * x0 - x1 * x1;
+      dv = e0 + et - 2 * mem_multiply_sum(RDB + by, RDB + by - tau, wy);
+      dv < 0 ? dv = 0;
+      DDB[tau] = dv;
+      cum += dv;
+      DNB[tau] = cum > 0 ? dv * tau / cum : 1;
+      tau += 1;
+    );
+    best = -1; tau = tmin;
+    while (best < 0 && tau < tmax) (
+      DNB[tau] < 0.15 ? (
+        best = tau;
+        while (best + 1 < tmax && DNB[best + 1] < DNB[best]) (best += 1;);
+      );
+      tau += 1;
+    );
+    best < 0 ? (
+      best = tmin; tau = tmin;
+      loop(tmax - tmin, DNB[tau] < DNB[best] ? best = tau; tau += 1;);
+    );
+    // octave-up guard: a clearly deeper dip at twice the period means best was half the period
+    going = 1;
+    while (going && 2 * best + 2 < tmax) (
+      t2 = 2 * best - 2; tau = 2 * best - 1;
+      loop(4, DNB[tau] < DNB[t2] ? t2 = tau; tau += 1;);
+      DNB[t2] < DNB[best] - 0.05 ? (best = t2;) : (going = 0;);
+    );
+    // continuity: keep the previous period if it is nearly as good
+    voiced == 1 ? (
+      tp = taup / dec;
+      best > 1.4 * tp || best < tp / 1.4 ? (
+        lo = max(tmin, floor(tp / 1.15)); hi = min(tmax - 1, ceil(tp * 1.15));
+        nb = lo; tau = lo;
+        loop(hi - lo + 1, DNB[tau] < DNB[nb] ? nb = tau; tau += 1;);
+        DNB[nb] < DNB[best] + 0.1 ? best = nb;
+      );
+    );
+    ap = DNB[best];
+    vnow = (ap < (voiced == 1 ? 0.3 : 0.2) && e0 > wy * 0.000001) ? 1 : 0;
+    // a voiced passage starts when two frames in a row agree on the period
+    voiced == 0 ? (
+      vnow == 1 && !(cand > 0 && abs(best - cand) < 0.15 * cand) ? vnow = 0;
+      cand = (ap < 0.2 && e0 > wy * 0.000001) ? best : 0;
+    );
+    // and needs 3 unvoiced frames in a row to end; meanwhile it keeps its period
+    vnow == 0 && voiced == 1 ? (
+      uvc += 1;
+      uvc < 3 ? vnow = 2;
+    ) : (
+      uvc = 0;
+    );
+    vnow == 1 ? (
+      y0 = DDB[best - 1]; y1 = DDB[best]; y2 = DDB[best + 1];
+      den = y0 - 2 * y1 + y2;
+      fr = den > 0 ? 0.5 * (y0 - y2) / den : 0;
+      fr = min(max(fr, -1), 1);
+      p0 = (best + fr) * dec;
+      // refine at the full rate on the low-passed signal: d at lags r0-3 .. r0+3, parabola at the minimum
+      wf = wy * dec;
+      r0 = floor(p0 + 0.5);
+      bf = ((ncount - wf + 1 - r0 - 4) & RFM) + r0 + 4;
+      e0f = mem_multiply_sum(RP + bf, RP + bf, wf);
+      q = 0;
+      loop(7,
+        tau = r0 - 3 + q;
+        DF7[q] = e0f + mem_multiply_sum(RP + bf - tau, RP + bf - tau, wf) - 2 * mem_multiply_sum(RP + bf, RP + bf - tau, wf);
+        q += 1;
+      );
+      bq = 1; q = 2;
+      loop(4, DF7[q] < DF7[bq] ? bq = q; q += 1;);
+      den = DF7[bq - 1] - 2 * DF7[bq] + DF7[bq + 1];
+      fr = den > 0 ? 0.5 * (DF7[bq - 1] - DF7[bq + 1]) / den : 0;
+      fr = min(max(fr, -1), 1);
+      per = r0 - 3 + bq + fr;
+      taup = per;
+    );
+    vnow == 2 ? (
+      vnow = 1; hold = 1;   // held: period and correction keep their last values
+    ) : (
+      hold = 0;
+    );
+    voiced = vnow;
+
+    // ---- correction
+    voiced == 1 && hold == 0 ? (
+      m = 69 + 12 * log(srate / per / refpitch) / log(2);
+      was_voiced == 0 ? (
+        corr = 0; age = 0; vc1 = m; vc2 = m; tgt = -1000; vph = 0; gl1 = 0; gl2 = 0; pc_prev = 0;
+      );
+      vc1 += a3 * (m - vc1); vc2 += a3 * (vc1 - vc2);
+      abs(m - vc2) > 1 ? (vc1 = m; vc2 = m;);
+      mv = vc2 + (m - vc2) * gnv;
+      // allowed notes
+      best_t = -1000; bd = 1000000000; tchg = 0;
+      use_midi = miditgt > 0 && nheld > 0;
+      use_midi && miditgt == 2 ? (
+        nn = 0;
+        loop(128,
+          HELD[nn] > 0 && abs(nn - mv) < bd ? (bd = abs(nn - mv); best_t = nn;);
+          nn += 1;
+        );
+      ) : (
+        base_n = floor(mv + 0.5);
+        oo = -12;
+        loop(25,
+          nn = base_n + oo;
+          (nn >= 0 && nn < 128 && note_ok(nn) && abs(nn - mv) < bd) ? (bd = abs(nn - mv); best_t = nn;);
+          oo += 1;
+        );
+      );
+      best_t > -1000 ? (
+        tgt > -1000 && best_t != tgt && abs(mv - tgt) < bd + 0.06 ? (
+          0;  // hysteresis: keep the current target
+        ) : (
+          best_t != tgt ? (
+            // a new note is retuned from the sung pitch
+            tgt > -1000 ? (tchg = 1;);
+            age = 0; corr = 0;
+          );
+          tgt = best_t;
+        );
+        // bypassed note nearest?
+        nc = floor(mv + 0.5);
+        !use_midi && BYPB[nc % 12] == 1 && abs(mv - nc) < abs(mv - tgt) ? (
+          ctarget = 0;
+        ) : (
+          dd_ = mv - tgt; ad = abs(dd_);
+          flex > 0 ? (
+            // half the gap to the neighbouring target on that side
+            hh = 6; oo = 1; found = 0;
+            while (!found && oo <= 12) (
+              note_ok(tgt + (dd_ >= 0 ? oo : -oo)) ? (hh = oo * 0.5; found = 1;);
+              oo += 1;
+            );
+            fl = flex / 100;
+            od = min(max((ad - hh * (1 - fl)) / fl, 0), ad);
+          ) : (
+            od = 0;
+          );
+          ctarget = dd_ >= 0 ? -(ad - od) : ad - od;
+        );
+      ) : (
+        ctarget = 0;
+      );
+      rs = retune / 1000;
+      humanize > 0 ? (
+        uh = min(max((age - 0.35) / 0.2, 0), 1);
+        rs *= 1 + 5 * (humanize / 100) * uh * uh * (3 - 2 * uh);
+      );
+      alpha = rs > 0 ? 1 - 2 ^ (-hop_s / rs) : 1;
+      corr += alpha * (ctarget - corr);
+      cv = 0;
+      vdepth > 0 ? (
+        uh = min(max((age - vdelay / 1000) / 0.3, 0), 1);
+        cv = vdepth / 100 * sin(2 * $pi * vph) * uh;
+        vph += vrate * hop_s;
+        vph -= floor(vph);
+      );
+      tchg ? (
+        // the jump of a target change glides out, so the output pitch stays continuous
+        dlt = pc_prev - (corr + cv);
+        gl1 += dlt; gl2 += dlt;
+      );
+      pc_prev = corr + cv;
+      shift = corr + (mv - m) + cv + transpose;
+      age += hop_s;
+      was_voiced = 1;
+    ) : voiced == 0 ? (
+      shift = 0;
+      was_voiced = 0;
+      per = p_uv;
+    );
+  );
+);
+
+// ---- pitch marks (voiced only)
+voiced == 1 ? (
+  mk_valid == 0 ? (
+    ncount - 1.3 * per > 0 ? (
+      lo = ceil(ncount - 1.2 * per); hi = floor(ncount - 0.2 * per);
+      bi = lo; bv = -1000000000; ni = lo; nv = 1000000000; i = lo;
+      loop(hi - lo + 1,
+        xs = RP[i & RFM];
+        xs > bv ? (bv = xs; bi = i;);
+        xs < nv ? (nv = xs; ni = i;);
+        i += 1;
+      );
+      // the first mark sits on the larger peak of either polarity
+      pol = bv >= -nv ? 1 : -1;
+      pk = pol > 0 ? bi : ni;
+      y0 = RP[(pk - 1) & RFM] * pol; y1 = RP[pk & RFM] * pol; y2 = RP[(pk + 1) & RFM] * pol;
+      den = y0 - 2 * y1 + y2;
+      fr = den < 0 ? 0.5 * (y0 - y2) / den : 0;
+      mk_last = pk + min(max(fr, -0.5), 0.5);
+      MKB[0] = mk_last; nmk = 1;
+      mk_valid = 1;
+    );
+  ) : (
+    // the next mark is one waveform period on: the lag that best matches this period with the next
+    r0 = floor(per + 0.5);
+    km = max(3, ceil(0.03 * per));
+    ncount >= mk_last + floor(r0 / 2) + r0 + km + 2 ? (
+      hb = (floor(mk_last + 0.5) - floor(r0 / 2)) & RFM;
+      ea = mem_multiply_sum(RP + hb, RP + hb, r0);
+      q = 0;
+      loop(2 * km + 1,
+        tau = r0 - km + q;
+        MDF[q] = ea + mem_multiply_sum(RP + hb + tau, RP + hb + tau, r0) - 2 * mem_multiply_sum(RP + hb, RP + hb + tau, r0);
+        q += 1;
+      );
+      qb = 0; q = 1;
+      loop(2 * km, MDF[q] < MDF[qb] ? qb = q; q += 1;);
+      fr = 0;
+      qb > 0 && qb < 2 * km ? (
+        den = MDF[qb - 1] - 2 * MDF[qb] + MDF[qb + 1];
+        fr = den > 0 ? 0.5 * (MDF[qb - 1] - MDF[qb + 1]) / den : 0;
+        fr = min(max(fr, -1), 1);
+      );
+      mk_last += r0 - km + qb + fr;
+      MKB[nmk & MKM] = mk_last; nmk += 1;
+    );
+  );
+) : (
+  mk_valid = 0;
+);
+
+// ---- synthesis
+// Grains belong to a regime: voiced (pitch-synchronous) or unvoiced (continuous reads at ratio 1).
+// When the regime changes, or the grain length jumps, the grains so far become "old" and the new
+// ones fade in by 1 - (normalized weight of the old ones), so the two always sum to one. The first
+// new grain keeps the old read delay, so old and new content line up.
+t = ncount - lat;
+shg = shift + gl2;
+voiced == 1 && mk_valid == 1 && (sp_ !== per || sshift !== shg) ? (
+  sp_ = per; sshift = shg;
+  update_vparams();
+);
+gl1 !== 0 || gl2 !== 0 ? (
+  gl1 *= gdec; gl2 = gdec * gl2 + (1 - gdec) * gl1;
+  abs(gl1) < 0.0001 && abs(gl2) < 0.0001 ? (gl1 = 0; gl2 = 0;);
+);
+want = voiced == 1 && mk_valid == 1;
+going = 1;
+while (going) (
+  rg = nold == 0 ? want : rgm;
+  rg ? (
+    g_f = v_f; g_hin = v_hin; g_hout = v_hout; g_ps = v_ps; g_gain = v_gain; g_c = v_c; g_tb = v_tb;
+  ) : (
+    g_f = u_f; g_hin = u_hin; g_hout = u_hout; g_ps = u_ps; g_gain = u_gain; g_c = 1; g_tb = u_tb;
+  );
+  s_next < -100000000 ? (s_next = t + g_hout; rgm = rg; h_last = g_hout;);
+  xf = nold == 0 && (rg != rgm || abs(g_hout - h_last) > 0.3 * min(g_hout, h_last));
+  !xf && t < s_next - g_hout ? (
+    going = 0;
+  ) : (
+    bound = lat - abs(g_hout - g_hin) - IH;
+    xf ? (
+      q = 0;
+      loop(GN, GRON[q] ? (GROLD[q] = 1; nold += 1;); q += 1;);
+      rgm = rg;
+      delta = max(delta, -bound);
+      rg ? (
+        ga = nearest_mark(t + 0.5 * g_ps - delta, 10 ^ 300);
+        s = ga + delta;
+      ) : (
+        s = t + 0.5 * g_hout;
+        ga = s - delta;
+      );
+    ) : (
+      s = s_next;
+      rg ? (
+        ga = nearest_mark(s, s + bound);
+      ) : (
+        ga = s - delta;
+        ga - s > bound ? ga = s + bound;
+      );
+    );
+    delta = s - ga;
+    slot = -1; q = 0;
+    while (slot < 0 && q < GN) (GRON[q] == 0 ? slot = q; q += 1;);
+    slot >= 0 ? (
+      GRON[slot] = 1; GROLD[slot] = 0; GRS[slot] = s; GRA[slot] = ga; GRF[slot] = g_f; GRH[slot] = g_hout;
+      GRG[slot] = g_gain; GRC[slot] = g_c; GRTB[slot] = g_tb;
+      // left half: flat for the first grain of a regime (the fade comes from the old grains);
+      // a grain whose left edge has passed (its length grew) rises over the time left, from zero
+      GRHL[slot] = xf ? 0 : min(g_hout, s - t + 1);
+    );
+    s_next = s + g_ps; h_last = g_hout;
+  );
+);
+
+// ---- output
+out_ol = out_or = out_nl = out_nr = sold = 0;
+stereo = ncount < stereo_until;
+q = 0;
+loop(GN,
+  GRON[q] ? (
+    dt = t - GRS[q];
+    dt >= GRH[q] ? (
+      GRON[q] = 0;
+      GROLD[q] ? nold -= 1;
+    ) : (
+      dt >= 0 ? (
+        wr = 0.5 + 0.5 * cos($pi * dt / GRH[q]);
+      ) : GRHL[q] == 0 ? (
+        wr = 1;
+      ) : dt > -GRHL[q] ? (
+        wr = 0.5 + 0.5 * cos($pi * dt / GRHL[q]);
+      ) : (
+        wr = 0;
+      );
+      wr > 0 ? (
+        pos = GRA[q] + GRF[q] * dt;
+        ip = floor(pos);
+        kr = GRTB[q] + floor((pos - ip) * NPH + 0.5) * NT;
+        st0 = (ip - (NT / 2 - 1)) & RFM;
+        sl = mem_multiply_sum(RL + st0, kr, NT);
+        sr = stereo ? mem_multiply_sum(RR + st0, kr, NT) : sl;
+        wgt = GRG[q] * wr;
+        GROLD[q] ? (
+          out_ol += wgt * sl; out_or += wgt * sr; sold += GRC[q] * wr;
+        ) : (
+          out_nl += wgt * sl; out_nr += wgt * sr;
+        );
+      );
+    );
+  );
+  q += 1;
+);
+fade = min(max(1 - sold, 0), 1);
+spl0 = out_ol + fade * out_nl;
+spl1 = out_or + fade * out_nr;
+ncount += 1;
