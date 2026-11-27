@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Blind Producers" commit="f7403035ada12e387de55f6515aa695e8afef7bf">
+<index version="1" name="Blind Producers" commit="b55cca93cc564788f6ec4d1f3ee465c71e9d5343">
   <category name="Dynamics">
     <reapack name="BP Carve.jsfx" type="effect" desc="BP Carve">
       <metadata>
@@ -16,6 +16,23 @@
       <version name="1.0" author="Blind Producers" time="2026-11-25T23:35:32Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source>https://github.com/BlindProducers/reapack/raw/26c120b4e39879c1d56f03a8db045db9f742f1eb/Dynamics/BP%20Carve.jsfx</source>
+      </version>
+    </reapack>
+    <reapack name="BP Ducker.jsfx" type="effect" desc="BP Ducker">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Ducks a track on every hit of a sidechain, of the track itself or of MIDI notes. A volume curve shapes each duck, a second curve can duck the low band on its own, and Follow ring-modulates the track with the sidechain.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Sidechain: send the kick to channels 3 and 4 of this track, which needs 4 channels. Set Trigger to Main input to duck on the track's own hits, or to MIDI notes to duck on every note-on.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Learned curve: set Curve mode to Learn and play a few bars of the kick. Nothing is ducked while it learns. Then set Curve mode to Match: both curves follow the kick until it has faded. Volume scale and Sub scale change each curve's length.\sa180\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.0" author="Blind Producers" time="2026-11-27T16:58:57Z">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source>https://github.com/BlindProducers/reapack/raw/b55cca93cc564788f6ec4d1f3ee465c71e9d5343/Dynamics/BP%20Ducker.jsfx</source>
       </version>
     </reapack>
   </category>
