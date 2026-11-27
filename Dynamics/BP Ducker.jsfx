@@ -1,0 +1,454 @@
+desc:BP Ducker
+author: Blind Producers
+version: 1.0
+tags: ducker sidechain ducking volume shaper kick bass midi
+changelog:
+  Initial release
+about:
+  Ducks a track on every hit of a sidechain, of the track itself or of MIDI notes. A volume curve shapes each duck, a second curve can duck the low band on its own, and Follow ring-modulates the track with the sidechain.
+  - Sidechain: send the kick to channels 3 and 4 of this track, which needs 4 channels. Set Trigger to Main input to duck on the track's own hits, or to MIDI notes to duck on every note-on.
+  - Learned curve: set Curve mode to Learn and play a few bars of the kick. Nothing is ducked while it learns. Then set Curve mode to Match: both curves follow the kick until it has faded. Volume scale and Sub scale change each curve's length.
+
+slider1:smode=0<0,2,1{Duck,Inverse,Inverse (polarity flipped)}>Mode
+slider2:samount=100<0,100,0.1>Amount (%)
+slider3:strig=0<0,2,1{Sidechain,Main input,MIDI notes}>Trigger
+slider4:sthresh=6<3,30,0.1>Threshold (dB)
+slider5:slocut=20<20,2000,1:log>Detector low cut (Hz)
+slider6:shicut=20000<200,20000,1:log>Detector high cut (Hz)
+slider7:scurve=0<0,2,1{Points,Learn,Match}>Curve mode
+slider8:sclear=0<0,1,1{Off,On}>Clear learned curve
+slider9:stime=200<10,1000,0.1:log>Time (ms)
+slider10:ssync=0<0,1,1{Off,On}>Sync to tempo
+slider11:snote=2<0,6,1{1/64,1/32,1/16,1/8,1/4,1/2,1/1}>Sync time
+slider12:satt=10<0,10,0.1>Attack (ms)
+slider13:sprehold=0<0,10,0.1>Hold before hit (ms)
+slider14:svdepth=100<0,100,0.1>Volume depth (%)
+slider15:svscale=100<10,400,0.1:log>Volume scale (%)
+slider16:svhold=0<0,100,0.1>Volume hold (%)
+slider17:svpt=50<0,100,0.1>Volume point time (%)
+slider18:svpv=50<0,100,0.1>Volume point level (%)
+slider19:svend=100<0,100,0.1>Volume end (%)
+slider20:svc1=-45<-100,100,0.1>Volume curve 1 (%)
+slider21:svc2=45<-100,100,0.1>Volume curve 2 (%)
+slider22:ssdepth=0<0,100,0.1>Sub depth (%)
+slider23:ssscale=100<10,400,0.1:log>Sub scale (%)
+slider24:scut=75<30,1000,1:log>Sub cutoff (Hz)
+slider25:sshold=0<0,100,0.1>Sub hold (%)
+slider26:sspt=50<0,100,0.1>Sub point time (%)
+slider27:sspv=50<0,100,0.1>Sub point level (%)
+slider28:ssend=100<0,100,0.1>Sub end (%)
+slider29:ssc1=-45<-100,100,0.1>Sub curve 1 (%)
+slider30:ssc2=45<-100,100,0.1>Sub curve 2 (%)
+slider31:sfollow=100<0,100,0.1>Follow (%)
+
+in_pin:Input L
+in_pin:Input R
+in_pin:Sidechain L
+in_pin:Sidechain R
+out_pin:Output L
+out_pin:Output R
+
+@init
+// Signal flow: the main input is delayed by LAT (10 ms) so a hit found now can be faded into before it
+// plays. Each hit schedules an envelope. Points: wait, Attack (cosine fade to the floor), Hold before hit,
+// then the curves play over Time. Match: the learned onset over those 10 ms, then the learned curve.
+// Curves are tables; 1 means no ducking. With @serialize, memory and variables survive the @init that
+// runs on every playback start, so everything the audio uses is reset below and the learned curve stays.
+LAT = floor(srate * 0.01);
+pdc_delay = LAT;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+TN = 1024;
+VTAB = 0;                 // volume curve, TN + 1 points
+STAB = 1100;              // sub curve
+RINGL = 4096;             // main input ring, left
+RINGR = RINGL + 8192;     // right
+PKR = RINGR + 8192;       // sidechain level for Follow, delayed like the audio
+MIDIQ = PKR + 8192;       // note-on offsets of the current block
+MBUF = MIDIQ + 1024;
+RMASK = 8191;
+
+// Learn: the detector's level from LAT before each hit, summed (LACC) and counted (LCNT) per sample, and
+// the learned curve: LPRE over the LAT samples before the hit, LPOST from the hit to the kick's end.
+PN = 1024;
+LN = 4096;
+LRING = 42000;            // the detector's level, for the LAT samples before a hit
+LPRE = 50200;             // PN + 1 points
+LPOST = 51300;            // LN + 1 points
+LACC = 56000;             // up to LMAXCAP + 1 samples each
+LCNT = 440100;
+LHB = 824200;             // work buffer for building the curve
+LMAXCAP = 384000;
+LMAX = min(floor(2 * srate), LMAXCAP);   // a hit is learned for 2 s at most
+END_LEV = 0.01;                          // a kick has ended once it stays 40 dB below its peak
+END_HOLD = floor(0.02 * srate);          // for 20 ms
+
+LEVEL_FLOOR = 0.00316;    // hits quieter than -50 dBFS are ignored
+MIN_GAP = floor(0.03 * srate);
+EF_REL = exp(-1 / (0.02 * srate));       // peak level, 20 ms release
+ES_COEF = 1 - exp(-1 / (0.04 * srate));  // average of the peak level over about 40 ms
+SMOOTH = 1 - exp(-1 / (0.01 * srate));   // depth changes glide over about 10 ms
+XO_STEP = 1 / (0.02 * srate);            // crossover fades in or out over 20 ms
+
+// Exponential segment from 0 at u = 0 to 1 at u = 1. A positive bend bows it up (it rises early),
+// a negative bend bows it down (it rises late); 0 is straight.
+function seg(u, bend) local(c)
+(
+  c = -20 * bend;
+  abs(c) < 0.000001 ? u : (exp(c * u) - 1) / (exp(c) - 1);
+);
+
+// Curve through (hold, 0), (point time, point level) and (end, 1), flat before and after.
+function build_curve(tab, thold, tpt, vpt, tend, b1, b2) local(t1, t2, t3, v2, i, x)
+(
+  t1 = min(max(thold / 100, 0), 0.98);
+  t2 = min(max(tpt / 100, t1 + 0.01), 0.99);
+  t3 = min(max(tend / 100, t2 + 0.01), 1);
+  v2 = min(max(vpt / 100, 0), 1);
+  i = 0;
+  loop(TN + 1,
+    x = i / TN;
+    tab[i] = x <= t1 ? 0
+      : x < t2 ? v2 * seg((x - t1) / (t2 - t1), b1 / 100)
+      : x < t3 ? v2 + (1 - v2) * seg((x - t2) / (t3 - t2), b2 / 100)
+      : 1;
+    i += 1;
+  );
+);
+
+// Table of n + 1 points read at phase 0..1; past the end it holds the last point.
+function curve_at(tab, n, ph) local(x, i)
+(
+  ph >= 1 ? tab[n] : (
+    x = ph * n;
+    i = floor(x);
+    tab[i] + (x - i) * (tab[i + 1] - tab[i]);
+  );
+);
+
+// Two-pole state-variable filter (trapezoidal), Butterworth damping; gives low-pass and high-pass.
+function svf_set(fc) instance(g, k, a1, a2, a3)
+(
+  g = tan($pi * min(fc, srate * 0.45) / srate);
+  k = sqrt(2);
+  a1 = 1 / (1 + g * (g + k));
+  a2 = g * a1;
+  a3 = g * a2;
+);
+
+function svf_tick(x) instance(ic1, ic2, k, a1, a2, a3, lp, hp) local(v1, v2, v3)
+(
+  v3 = x - ic2;
+  v1 = a1 * ic1 + a2 * v3;
+  v2 = ic2 + a2 * ic1 + a3 * v3;
+  ic1 = 2 * v1 - ic1;
+  ic2 = 2 * v2 - ic2;
+  lp = v2;
+  hp = x - k * v1 - v2;
+);
+
+function svf_clear() instance(ic1, ic2, lp, hp) ( ic1 = ic2 = lp = hp = 0; );
+
+function set_crossover(fc)
+(
+  xa_l.svf_set(fc); xb_l.svf_set(fc); xc_l.svf_set(fc);
+  xa_r.svf_set(fc); xb_r.svf_set(fc); xc_r.svf_set(fc);
+);
+
+function clear_crossover()
+(
+  xa_l.svf_clear(); xb_l.svf_clear(); xc_l.svf_clear();
+  xa_r.svf_clear(); xb_r.svf_clear(); xc_r.svf_clear();
+);
+
+// ---- Learn ----
+function learn_reset()
+(
+  memset(LACC, 0, LMAX + 1);
+  memset(LCNT, 0, LMAX + 1);
+  lnw = lk = lrec = ldirty = 0;
+);
+
+function learn_clear() local(i)
+(
+  learn_reset();
+  i = 0; loop(PN + 1, LPRE[i] = 1; i += 1; );
+  i = 0; loop(LN + 1, LPOST[i] = 1; i += 1; );
+  lpost_ms = 100;
+  lvalid = 0;
+);
+
+// The learned gain at sample x (fractional) of the outline in LHB: 0 at the peak, 1 where the outline
+// starts and where the kick ends, mirroring the level in between.
+function learn_gain(x) local(i, e)
+(
+  i = floor(x);
+  e = i < lb_end ? LHB[i] + (x - i) * (LHB[i + 1] - LHB[i]) : LHB[lb_end];
+  min(max(x <= lb_pk ? 1 - (e - lb_e0) / (lb_ep - lb_e0) : 1 - (e - lb_ee) / (lb_ep - lb_ee), 0), 1);
+);
+
+// Average what Learn heard, draw its outline (rising to the loudest sample, then falling through the peaks
+// to the kick's end) and turn it into LPRE and LPOST. A level that never rises keeps the old curve.
+function learn_build() local(nw, k, r, j, last, found, len)
+(
+  ldirty = 0;
+  nw = lnw;
+  nw > LAT + 1 ? (
+    k = 0;
+    loop(nw, LHB[k] = LACC[k] / max(LCNT[k], 1); k += 1; );
+    lb_pk = 0; k = 1;
+    loop(nw - 1, LHB[k] > LHB[lb_pk] ? lb_pk = k; k += 1; );
+    lb_ep = LHB[lb_pk];
+    // the kick ends at its last sample above END_LEV of the peak, once END_HOLD quieter samples follow
+    last = lb_pk; found = 0; k = lb_pk + 1;
+    while (k < nw && !found) (
+      LHB[k] >= END_LEV * lb_ep ? last = k : k - last >= END_HOLD ? found = 1;
+      k += 1;
+    );
+    lb_end = found ? last : nw - 1;
+    // outline up to the peak: the loudest level so far, flat until the kick starts
+    k = 1; loop(lb_pk, LHB[k] = max(LHB[k], LHB[k - 1]); k += 1; );
+    // from the peak to the end: straight lines between the samples at least as loud as every one after them
+    r = lb_end; k = lb_end - 1;
+    loop(lb_end - lb_pk,
+      LHB[k] >= LHB[r] ? (
+        j = k + 1;
+        loop(r - k - 1, LHB[j] = LHB[k] + (LHB[r] - LHB[k]) * (j - k) / (r - k); j += 1; );
+        r = k;
+      );
+      k -= 1;
+    );
+    lb_e0 = LHB[0];
+    lb_ee = LHB[lb_end];
+    lb_ep - lb_e0 > 0.000001 && lb_ep - lb_ee > 0.000001 ? (
+      k = 0; loop(PN + 1, LPRE[k] = learn_gain(k * LAT / PN); k += 1; );
+      len = max(lb_end - LAT, 1);
+      k = 0; loop(LN + 1, LPOST[k] = learn_gain(LAT + k * len / LN); k += 1; );
+      lpost_ms = 1000 * len / srate;
+      lvalid = 1;
+    );
+  );
+);
+
+// Leaving Learn: count the hit being learned and build the curve from everything heard.
+function learn_finish()
+(
+  lrec ? ( lnw = max(lnw, lk); lrec = 0; );
+  ldirty ? learn_build();
+);
+
+function update_params()
+(
+  svhold !== p_vh || svpt !== p_vp || svpv !== p_vv || svend !== p_ve || svc1 !== p_v1 || svc2 !== p_v2 ? (
+    build_curve(VTAB, svhold, svpt, svpv, svend, svc1, svc2);
+    p_vh = svhold; p_vp = svpt; p_vv = svpv; p_ve = svend; p_v1 = svc1; p_v2 = svc2;
+  );
+  sshold !== p_sh || sspt !== p_sp || sspv !== p_sv || ssend !== p_se || ssc1 !== p_s1 || ssc2 !== p_s2 ? (
+    build_curve(STAB, sshold, sspt, sspv, ssend, ssc1, ssc2);
+    p_sh = sshold; p_sp = sspt; p_sv = sspv; p_se = ssend; p_s1 = ssc1; p_s2 = ssc2;
+  );
+  slocut !== p_lo ? ( det_hp.svf_set(slocut); p_lo = slocut; );
+  shicut !== p_hi ? ( det_lp.svf_set(shicut); p_hi = shicut; );
+  scut !== p_cut ? ( set_crossover(scut); p_cut = scut; );
+
+  amt = scurve === 1 ? 0 : samount / 100;   // Learn: no ducking at all
+  dv_t = svdepth / 100 * amt;
+  ds_t = ssdepth / 100 * amt;
+  fo_t = sfollow / 100 * amt;
+  thr = 10 ^ (sthresh / 20);
+  rearm = 10 ^ (sthresh / 40);
+  n_pre = min(floor(sprehold * srate / 1000 + 0.5), LAT);
+  n_att = min(floor(satt * srate / 1000 + 0.5), LAT - n_pre);
+);
+
+// ---- reset ----
+lsr !== srate ? ( learn_reset(); lsr = srate; );   // what Learn heard is in samples at this rate
+linit !== 1 ? ( learn_clear(); linit = 1; );
+memset(RINGL, 0, 8192); memset(RINGR, 0, 8192); memset(LRING, 0, 8192);
+det_hp.svf_clear(); det_lp.svf_clear(); clear_crossover();
+p_vh = p_sh = p_lo = p_hi = p_cut = -1000000;
+update_params();
+dv = dv_t; ds = ds_t; fo = fo_t;
+xo = ds_t > 0;
+wp = 0;
+ef = es = 0; armed = 1; gap = MIN_GAP;
+est = 0; ecnt = 0; phv = phs = ovh = osh = 1; cv = cs = 1; av0 = as0 = 1;
+memset(PKR, 0, 8192);
+mqn = mqi = spos = 0;
+lrec ? ( lnw = max(lnw, lk); lrec = 0; );   // a restart ends the hit being learned
+
+@serialize
+file_var(0, lvalid);
+file_var(0, lpost_ms);
+file_mem(0, LPRE, PN + 1);
+file_mem(0, LPOST, LN + 1);
+
+@slider
+sclear ? (
+  learn_clear();
+  sclear = 0;
+  sliderchange(sclear);
+);
+scurve !== 1 ? learn_finish();
+update_params();
+
+@block
+scurve !== 1 ? learn_finish();
+
+tms = scurve === 2 ? lpost_ms : ssync ? 60000 / max(tempo, 1) * 2 ^ (snote - 4) : stime;
+dphv = 1000 / (min(max(tms * svscale / 100, 0.1), 32000) * srate);
+dphs = 1000 / (min(max(tms * ssscale / 100, 0.1), 32000) * srate);
+
+mqn = mqi = spos = 0;
+while (
+  mlen = midirecv_buf(mofs, MBUF, 4096);
+  mlen > 0 ? (
+    midisend_buf(mofs, MBUF, mlen);
+    strig === 2 && mlen === 3 && (MBUF[0] & 0xF0) === 0x90 && MBUF[2] > 0 && mqn < 1024 ? (
+      MIDIQ[mqn] = mofs; mqn += 1;
+    );
+  );
+  mlen > 0;
+);
+
+@sample
+xl = spl0; xr = spl1;
+
+// ---- hit detection ----
+det_hp.svf_tick(strig === 1 ? 0.5 * (xl + xr) : 0.5 * (spl2 + spl3));
+det_lp.svf_tick(det_hp.hp);
+lv = abs(det_lp.lp);
+trig = 0;
+strig === 2 ? (
+  while (mqi < mqn && MIDIQ[mqi] <= spos ? ( trig = 1; mqi += 1; 1 ) : 0);
+) : (
+  ef = max(lv, ef * EF_REL);
+  es += ES_COEF * (ef - es);
+  gap += 1;
+  armed ? (
+    ef > LEVEL_FLOOR && ef > es * thr && gap >= MIN_GAP ? ( trig = 1; armed = 0; gap = 0; );
+  ) : (
+    ef < es * rearm ? armed = 1;
+  );
+);
+spos += 1;
+
+// ---- envelope ----
+// A hit found now plays LAT samples later. Points: wait, fade down over n_att, hold n_pre, then run the
+// curves. Match: play the learned onset over the LAT samples, then the learned curve, never above the
+// curve of the hit before.
+trig && est === 0 && scurve !== 1 ? (
+  scurve === 0 ? (
+    est = 1; ecnt = LAT - n_att - n_pre;
+  ) : lvalid ? (
+    est = 4; ecnt = 0; ovh = phv; osh = phs;
+  );
+);
+est === 1 && ecnt <= 0 ? ( est = 2; ecnt = 0; av0 = cv; as0 = cs; );
+est <= 1 ? (
+  scurve === 2 ? (
+    lvalid ? (
+      cv = min(curve_at(LPOST, LN, phv), curve_at(LPOST, LN, ovh));
+      cs = min(curve_at(LPOST, LN, phs), curve_at(LPOST, LN, osh));
+      ovh < 1 ? ovh += dphv;
+      osh < 1 ? osh += dphs;
+    ) : cv = cs = 1;
+  ) : (
+    cv = curve_at(VTAB, TN, phv);
+    cs = curve_at(STAB, TN, phs);
+  );
+  phv < 1 ? phv += dphv;
+  phs < 1 ? phs += dphs;
+  est === 1 ? ecnt -= 1;
+) : est === 2 ? (
+  ecnt < n_att ? (
+    ecnt += 1;
+    w = 0.5 + 0.5 * cos($pi * ecnt / n_att);
+    cv = av0 * w; cs = as0 * w;
+  ) : est = 3;
+) : est === 4 ? (
+  w = curve_at(LPRE, PN, ecnt / LAT);
+  cv = min(w, curve_at(LPOST, LN, ovh));
+  cs = min(w, curve_at(LPOST, LN, osh));
+  ovh < 1 ? ovh += dphv;
+  osh < 1 ? osh += dphs;
+  ecnt += 1;
+  ecnt >= LAT ? ( est = 0; phv = phs = 0; );
+);
+est === 3 ? (
+  ecnt < n_att + n_pre ? (
+    ecnt += 1;
+    cv = cs = 0;
+  ) : (
+    est = 0; phv = phs = 0;
+    cv = curve_at(VTAB, TN, 0); cs = curve_at(STAB, TN, 0);
+    phv += dphv; phs += dphs;
+  );
+);
+
+dv += SMOOTH * (dv_t - dv);
+ds += SMOOTH * (ds_t - ds);
+fo += SMOOTH * (fo_t - fo);
+
+// ---- main audio delay ----
+wp = (wp + 1) & RMASK;
+rd = (wp - LAT) & RMASK;
+RINGL[wp] = xl; RINGR[wp] = xr;
+dl = RINGL[rd]; dr = RINGR[rd];
+
+// ---- Learn: add the detector's level from LAT before each hit until the next hit, 2 s at most ----
+scurve === 1 ? (
+  trig ? (
+    lrec ? (
+      // the hit being learned ends where this one's lookback starts
+      j = 1;
+      loop(LAT, LACC[lk - j] -= LRING[(wp - j) & RMASK]; LCNT[lk - j] -= 1; j += 1; );
+      lnw = max(lnw, lk - LAT);
+    );
+    j = 0;
+    loop(LAT, LACC[j] += LRING[(wp - LAT + j) & RMASK]; LCNT[j] += 1; j += 1; );
+    lk = LAT; lrec = 1; ldirty = 1;
+  );
+  lrec ? (
+    LACC[lk] += lv; LCNT[lk] += 1; lk += 1;
+    lk >= LMAX ? ( lnw = max(lnw, LMAX); lrec = 0; );
+  );
+);
+LRING[wp] = lv;
+
+// ---- Follow: ring modulation by the sidechain ----
+// Each sample the track is multiplied by 1 - Follow x the sidechain level (the louder channel, at most 1),
+// lined up with the delayed audio, unless the curves duck it more.
+PKR[wp] = min(max(abs(spl2), abs(spl3)), 1);
+gv = min(1 - dv * (1 - cv), 1 - fo * PKR[rd]);
+gs = 1 - ds * (1 - cs);
+
+// ---- low band ----
+ds_t > 0 ? (
+  xo <= 0 ? clear_crossover();
+  xo = min(xo + XO_STEP, 1);
+) : xo = max(xo - XO_STEP, 0);
+
+xo > 0 ? (
+  xa_l.svf_tick(dl); xb_l.svf_tick(xa_l.lp); xc_l.svf_tick(xa_l.hp);
+  xa_r.svf_tick(dr); xb_r.svf_tick(xa_r.lp); xc_r.svf_tick(xa_r.hp);
+  refl = (1 - xo) * dl + xo * (xb_l.lp + xc_l.hp);
+  refr = (1 - xo) * dr + xo * (xb_r.lp + xc_r.hp);
+  bandl = refl + xo * (gs - 1) * xb_l.lp;
+  bandr = refr + xo * (gs - 1) * xb_r.lp;
+) : (
+  refl = bandl = dl;
+  refr = bandr = dr;
+);
+
+// ---- output ----
+outl = gv * bandl;
+outr = gv * bandr;
+smode === 0 ? (
+  spl0 = outl; spl1 = outr;
+) : smode === 1 ? (
+  spl0 = refl - outl; spl1 = refr - outr;
+) : (
+  spl0 = outl - refl; spl1 = outr - refr;
+);
